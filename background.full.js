@@ -55,6 +55,8 @@ const OFFSCREEN_IDLE_CLOSE_MS = 15000;
 const MAX_EMBEDDED_EXTRACTS_TOTAL = 2;
 const MAX_EMBEDDED_EXTRACTS_PER_TAB = 1;
 const RESULT_CHUNK_TTL_MS = 5 * 60 * 1000;
+const ASSEMBLY_POLL_TIMEOUT_MS = 5 * 60 * 1000;
+const ASSEMBLY_POLL_INTERVAL_MS = 3000;
 
 function logOffscreenLifecycle(event, extra = {}) {
   console.log('[Background][Offscreen]', event, {
@@ -1099,12 +1101,7 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
   let lastBody = '';
   let detectedLang = '';
   let forcedLang = (opts.sourceLanguage || '').trim() || null;
-  const langCandidates = (() => {
-    const list = [];
-    if (forcedLang) list.push(forcedLang);
-    list.push('en', 'ja'); // common alternates for mixed content
-    return Array.from(new Set(list.filter(Boolean)));
-  })();
+  const langCandidates = Array.from(new Set(['en', 'ja'])); // common alternates for mixed content
   const totalBytes = audioWindows.reduce((sum, w) => sum + (w?.audioBlob?.size || 0), 0);
   const CF_MAX_WAV_BYTES = 4 * 1024 * 1024; // Guard below observed effective limit despite docs quoting higher
   audioWindows.forEach((win, idx) => {
@@ -1186,8 +1183,12 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
     allSegments.push(...adjusted);
     if (ctx?.tabId) {
       sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare detect complete (${segs.length} segments, lang=${detectRes.language || 'n/a'})`, 'info');
+      if (!segs.length) {
+        sendDebugLog(ctx.tabId, ctx.messageId, 'First window returned no segments; retrying with per-window autodetect for all windows.', 'warn');
+      }
     }
-    startIdx = 1;
+    // If detection produced no segments, retry window 1 in the main loop so it also benefits from the per-window autodetect order.
+    startIdx = segs.length ? 1 : 0;
   }
 
   if (!forcedLang) {
@@ -1204,9 +1205,17 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
     }
     const langOrder = (() => {
       const order = [];
-      if (forcedLang) order.push(forcedLang);
-      langCandidates.forEach((l) => { if (!order.includes(l)) order.push(l); });
-      if (!order.length) order.push(null);
+      const seen = new Set();
+      const push = (lang) => {
+        const key = lang || 'auto';
+        if (seen.has(key)) return;
+        order.push(lang);
+        seen.add(key);
+      };
+      // Always allow Cloudflare to auto-detect per window before falling back to hints.
+      push(forcedLang || null);
+      push(null);
+      langCandidates.forEach(push);
       return order;
     })();
     let res = null;
@@ -1222,7 +1231,7 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
           filename: opts.filename ? `${opts.filename}_${i + 1}.wav` : `audio_${i + 1}.wav`,
           forceJson: !!lang
         }, ctx);
-        forcedLang = lang || forcedLang; // stick with the last successful language
+        forcedLang = lang || forcedLang; // stick with the last successful language (still allow auto attempts next window)
         break;
       } catch (err) {
         lastErr = err;
@@ -1325,12 +1334,21 @@ function __xsyncHandleMessage(message, sender, sendResponse) {
     }
 
     if (message?.type === 'AUTOSUB_REQUEST') {
-      handleAutoSubRequest(message, sender.tab?.id)
-        .then(reply)
-        .catch((error) => {
-          console.error('[Background] Auto-sub error:', error);
-          reply({ success: false, error: error?.message || 'Unknown error' });
-        });
+      if (message?.data?.useAssembly) {
+        handleAssemblyAutoSubRequest(message, sender.tab?.id)
+          .then(reply)
+          .catch((error) => {
+            console.error('[Background] Auto-sub (Assembly) error:', error);
+            reply({ success: false, error: error?.message || 'Unknown error' });
+          });
+      } else {
+        handleAutoSubRequest(message, sender.tab?.id)
+          .then(reply)
+          .catch((error) => {
+            console.error('[Background] Auto-sub error:', error);
+            reply({ success: false, error: error?.message || 'Unknown error' });
+          });
+      }
       return true;
     }
 
@@ -2057,38 +2075,8 @@ async function handleAutoSubRequest(message, tabId) {
         sendAutoSubResult(tabId, messageId, payload);
         return payload;
       } catch (cfErr) {
-        if (!isMixedLangError(cfErr)) throw cfErr;
-        sendDebugLog(tabId, messageId, `Cloudflare reported mixed language; falling back to local Whisper autodetect... (${cfErr?.message || cfErr})`, 'warn');
-        sendAutoSubProgress(tabId, messageId, 68, 'Cloudflare rejected audio; retrying locally...', 'transcribe');
-        const whisperSegs = await transcribeAudioWindows(
-          audioWindows,
-          'single',
-          (p, status) => sendAutoSubProgress(tabId, messageId, Math.min(92, Math.round(p)), status || 'Transcribing with Whisper...', 'transcribe'),
-          ctx
-        );
-        const normalizedSegs = whisperSegs.map((seg) => ({
-          start: (seg.startMs || 0) / 1000,
-          end: (seg.endMs || seg.startMs || 0) / 1000,
-          text: seg.text || seg.transcript || ''
-        }));
-        const srt = segmentsToSrt(normalizedSegs);
-        const totalBytes = audioWindows.reduce((sum, w) => sum + (w?.audioBlob?.size || 0), 0);
-        const payload = {
-          success: true,
-          srt,
-          languageCode: sourceLanguage || 'und',
-          segmentCount: normalizedSegs.length,
-          cfStatus: null,
-          cfBody: '',
-          model: `${model || '@cf/openai/whisper'}+local-fallback`,
-          audioBytes: totalBytes,
-          audioSource: 'extension',
-          contentType: 'audio/wav'
-        };
-        sendAutoSubProgress(tabId, messageId, 96, 'Transcript ready (local fallback). Finalizing...', 'package');
-        sendDebugLog(tabId, messageId, `Local Whisper fallback succeeded (${normalizedSegs.length} segments)`, 'info');
-        sendAutoSubResult(tabId, messageId, payload);
-        return payload;
+        sendDebugLog(tabId, messageId, `Cloudflare transcription failed: ${cfErr?.message || cfErr}`, 'error');
+        throw cfErr;
       }
     };
 
@@ -2122,6 +2110,236 @@ async function handleAutoSubRequest(message, tabId) {
     const payload = { success: false, error: msg };
     sendAutoSubResult(tabId, messageId, payload);
     return payload;
+  }
+}
+
+async function uploadToAssemblyFromBlob(apiKey, blob, logger) {
+  if (!apiKey) throw new Error('AssemblyAI API key missing');
+  if (!blob) throw new Error('No upload payload provided');
+  const headers = { Authorization: apiKey };
+  if (blob.type) headers['Content-Type'] = blob.type;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120000);
+  let response = null;
+  let raw = '';
+  try {
+    logger?.('Uploading media to AssemblyAI...', 'info');
+    response = await fetch('https://api.assemblyai.com/v2/upload', {
+      method: 'POST',
+      headers,
+      body: blob,
+      signal: controller.signal
+    });
+    raw = await response.text();
+  } catch (err) {
+    clearTimeout(timeout);
+    if (err.name === 'AbortError') throw new Error('AssemblyAI upload timed out');
+    throw err;
+  }
+  clearTimeout(timeout);
+  let data = null;
+  try { data = raw ? JSON.parse(raw) : null; } catch (_) { data = null; }
+  if (!response.ok || !data?.upload_url) {
+    const msg = data?.error || data?.message || raw || `AssemblyAI upload failed (${response?.status || 'no status'})`;
+    throw new Error(msg);
+  }
+  return data.upload_url;
+}
+
+async function createAssemblyTranscriptClient(apiKey, payload = {}, logger) {
+  const body = {
+    punctuate: true,
+    format_text: true,
+    speaker_labels: payload.speaker_labels === false ? false : true,
+    disfluencies: true,
+    audio_url: payload.audio_url
+  };
+  if (payload.language_code) {
+    body.language_code = payload.language_code;
+  } else {
+    body.language_detection = true;
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  try {
+    logger?.('Requesting AssemblyAI transcript...', 'info');
+    const resp = await fetch('https://api.assemblyai.com/v2/transcript', {
+      method: 'POST',
+      headers: {
+        Authorization: apiKey,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok || !data?.id) {
+      const msg = data?.error || data?.message || `AssemblyAI transcript request failed (${resp.status})`;
+      throw new Error(msg);
+    }
+    return data.id;
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('AssemblyAI transcript request timed out');
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function pollAssemblyTranscriptClient(apiKey, transcriptId, logger) {
+  const start = Date.now();
+  while (Date.now() - start < ASSEMBLY_POLL_TIMEOUT_MS) {
+    const resp = await fetch(`https://api.assemblyai.com/v2/transcript/${encodeURIComponent(transcriptId)}`, {
+      headers: { Authorization: apiKey }
+    });
+    const data = await resp.json().catch(() => null);
+    const status = (data?.status || '').toLowerCase();
+    if (status === 'completed') return data;
+    if (status === 'error') {
+      const msg = data?.error || data?.message || 'AssemblyAI returned an error';
+      throw new Error(msg);
+    }
+    logger?.(`AssemblyAI status: ${status || 'pending'}...`, 'info');
+    await new Promise((r) => setTimeout(r, ASSEMBLY_POLL_INTERVAL_MS));
+  }
+  throw new Error('AssemblyAI transcription timed out');
+}
+
+async function fetchAssemblySrtClient(apiKey, transcriptId, logger) {
+  const resp = await fetch(`https://api.assemblyai.com/v2/transcript/${encodeURIComponent(transcriptId)}/srt`, {
+    headers: { Authorization: apiKey }
+  });
+  if (!resp.ok) {
+    logger?.(`AssemblyAI SRT fetch failed (${resp.status})`, 'warn');
+    return '';
+  }
+  return await resp.text();
+}
+
+async function handleAssemblyAutoSubRequest(message, tabId) {
+  const { messageId, data = {} } = message || {};
+  const streamUrl = data.streamUrl;
+  const apiKey = (data.assemblyApiKey || '').trim();
+  let sourceLanguage = (data.sourceLanguage || data.language || '').trim();
+  const diarization = data.diarization === true;
+  const sendFullVideo = data.sendFullVideo === true;
+  const pageHeaders = data.pageHeaders || null;
+  const ctx = { tabId, messageId, pageHeaders };
+
+  if (!streamUrl) return { success: false, error: 'Missing stream URL' };
+  if (!apiKey) return { success: false, error: 'AssemblyAI API key is required' };
+
+  const logToPage = (text, level = 'info') => sendDebugLog(tabId, messageId, text, level);
+  const progress = (pct, status, stage = 'info', level = 'info') => sendAutoSubProgress(tabId, messageId, pct, status, stage, level);
+
+  try {
+    const baseHeaders = (() => {
+      const h = pageHeaders || {};
+      const headers = {};
+      if (h.referer) headers['Referer'] = h.referer;
+      if (h.cookie) headers['Cookie'] = h.cookie;
+      if (h.userAgent) headers['User-Agent'] = h.userAgent;
+      return Object.keys(headers).length ? headers : null;
+    })();
+
+    progress(5, 'Preparing AssemblyAI pipeline...', 'fetch');
+    const isHls = /\.m3u8(\?|$)/i.test(streamUrl);
+    let uploadBlob = null;
+    let contentType = '';
+    let usedFullVideo = sendFullVideo === true;
+
+    if (sendFullVideo) {
+      if (isHls) {
+        const full = await fetchFullHlsStream(streamUrl, (p) => progress(Math.min(60, 5 + Math.round(p * 0.55)), 'Fetching full stream...', 'fetch'), baseHeaders);
+        uploadBlob = new Blob([full.buffer], { type: full.contentType || 'video/mp2t' });
+        contentType = uploadBlob.type || full.contentType || 'video/mp2t';
+      } else {
+        const full = await fetchFullStreamBuffer(streamUrl, (p) => progress(Math.min(60, p), 'Fetching full stream...', 'fetch'), baseHeaders);
+        uploadBlob = new Blob([full.buffer], { type: full.contentType || 'video/mp4' });
+        contentType = uploadBlob.type || full.contentType || 'video/mp4';
+      }
+    } else {
+      const planInput = {
+        preset: 'complete',
+        fullScan: true,
+        coveragePct: 1,
+        minWindows: 1,
+        maxWindows: 1,
+        requestedWindowSeconds: 6 * 3600,
+        maxChunkSeconds: 6 * 3600
+      };
+      const audioWindows = await extractAudioFromStream(
+        streamUrl,
+        planInput,
+        (p, status) => progress(Math.min(70, Math.round(p)), status || 'Extracting audio...', 'fetch'),
+        ctx,
+        {}
+      );
+      if (!audioWindows || !audioWindows.length) {
+        throw new Error('Audio extraction returned no audio blob');
+      }
+      if (audioWindows.length > 1) {
+        try {
+          const stitched = await stitchWavWindows(audioWindows, ctx);
+          uploadBlob = stitched?.blob || null;
+          contentType = uploadBlob?.type || 'audio/wav';
+          const stitchedDur = stitched?.durationMs ? `${Math.round(stitched.durationMs / 1000)}s` : '?s';
+          const stitchedMb = stitched?.bytes
+            ? `${Math.round(stitched.bytes / (1024 * 1024))}MB`
+            : `${Math.round((uploadBlob?.size || 0) / (1024 * 1024))}MB`;
+          logToPage(`Combined ${audioWindows.length} audio windows into single WAV (~${stitchedDur}, ${stitchedMb})`, 'info');
+        } catch (combineErr) {
+          logToPage(`Failed to combine audio windows; using first window only (${combineErr?.message || combineErr})`, 'warn');
+        }
+      }
+      if (!uploadBlob) {
+        const first = Array.isArray(audioWindows) ? audioWindows[0] : null;
+        uploadBlob = first?.audioBlob || first?.audio || (first?.audioBuffer ? new Blob([first.audioBuffer], { type: 'audio/wav' }) : null);
+        contentType = uploadBlob?.type || 'audio/wav';
+      }
+      if (!uploadBlob) {
+        throw new Error('Audio extraction returned no audio blob');
+      }
+      usedFullVideo = false;
+    }
+
+    const uploadBytes = uploadBlob?.size || null;
+    progress(72, 'Uploading to AssemblyAI...', 'transcribe');
+    const uploadUrl = await uploadToAssemblyFromBlob(apiKey, uploadBlob, (msg, lvl) => logToPage(msg, lvl || 'info'));
+    const transcriptId = await createAssemblyTranscriptClient(apiKey, {
+      audio_url: uploadUrl,
+      language_code: sourceLanguage,
+      speaker_labels: diarization !== false
+    }, (msg, lvl) => logToPage(msg, lvl || 'info'));
+    logToPage(`AssemblyAI transcript id: ${transcriptId}`, 'info');
+    progress(80, 'Polling AssemblyAI...', 'transcribe');
+    const transcriptData = await pollAssemblyTranscriptClient(apiKey, transcriptId, (msg, lvl) => logToPage(msg, lvl || 'info'));
+    if (!sourceLanguage && transcriptData?.language) {
+      sourceLanguage = transcriptData.language;
+    }
+    progress(92, 'Fetching SRT...', 'package');
+    const assemblySrt = await fetchAssemblySrtClient(apiKey, transcriptId, (msg, lvl) => logToPage(msg, lvl || 'info'));
+    const srt = assemblySrt || '';
+    if (!srt) throw new Error('AssemblyAI returned no SRT');
+    progress(98, 'Transcript ready. Finalizing...', 'package');
+    const transcriptPayload = {
+      srt,
+      languageCode: sourceLanguage || transcriptData?.language || 'und',
+      model: 'assemblyai',
+      assemblyId: transcriptId,
+      audioBytes: uploadBytes,
+      audioSource: sendFullVideo ? 'extension-full-video' : 'extension-audio',
+      contentType,
+      usedFullVideo
+    };
+    const payload = { success: true, transcript: transcriptPayload, ...transcriptPayload };
+    sendAutoSubResult(tabId, messageId, payload);
+    progress(100, 'AssemblyAI transcription complete', 'package', 'success');
+    return payload;
+  } catch (error) {
+    progress(100, `AssemblyAI failed: ${error?.message || error}`, 'error', 'error');
+    sendAutoSubResult(tabId, messageId, { success: false, error: error?.message || 'AssemblyAI transcription failed' });
+    return { success: false, error: error?.message || 'AssemblyAI transcription failed' };
   }
 }
 /**
@@ -2882,8 +3100,8 @@ async function decodeWindowsOffscreen(windows, mode, onProgress, ctx = null, opt
       const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
       if (!u8?.byteLength) continue;
 
-      const key = u8.buffer;
-      const cached = sharedBuffers.get(key);
+      const cacheKey = win.buffer && typeof win.buffer === 'object' ? win.buffer : u8.buffer;
+      const cached = sharedBuffers.get(cacheKey);
 
       let transferId = cached?.transferId || null;
       let directBuffer = cached?.directBuffer || null;
@@ -2915,7 +3133,7 @@ async function decodeWindowsOffscreen(windows, mode, onProgress, ctx = null, opt
           logToPage(`Reusing direct buffer for window #${i + 1} (${u8.byteLength} bytes)`, 'debug');
           directBuffers += 1;
         }
-        sharedBuffers.set(key, { transferId, directBuffer, transferMethod });
+        sharedBuffers.set(cacheKey, { transferId, directBuffer, transferMethod });
       } else {
         logToPage(`Reusing shared buffer for window #${i + 1} (${transferId ? transferMethod || 'chunked' : 'direct'})`, 'debug');
         reusedBuffers += 1;
@@ -3177,10 +3395,106 @@ async function inspectWavBuffer(input) {
     bytes,
     fmt,
     dataBytes,
+    dataOffset: dataStart,
     samples,
     durationMs,
     reason: null
   };
+}
+
+async function stitchWavWindows(windows, ctx = null) {
+  const sorted = Array.isArray(windows) ? [...windows].sort((a, b) => {
+    const aStart = Number.isFinite(a?.startMs) ? a.startMs : Number.isFinite(a?.startSec) ? a.startSec * 1000 : 0;
+    const bStart = Number.isFinite(b?.startMs) ? b.startMs : Number.isFinite(b?.startSec) ? b.startSec * 1000 : 0;
+    return aStart - bStart;
+  }) : [];
+
+  const chunks = [];
+  let baseFmt = null;
+  let totalDataBytes = 0;
+
+  const toUint8 = async (input) => {
+    if (!input) return null;
+    if (input instanceof Uint8Array) return input;
+    if (input instanceof ArrayBuffer) return new Uint8Array(input);
+    if (ArrayBuffer.isView(input)) return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+    if (typeof input.arrayBuffer === 'function') {
+      const buf = await input.arrayBuffer();
+      return new Uint8Array(buf);
+    }
+    return null;
+  };
+
+  for (let i = 0; i < sorted.length; i++) {
+    const win = sorted[i];
+    const src = win?.audioBlob || win?.audio || win;
+    if (!src) continue;
+    const meta = await inspectWavBuffer(src);
+    if (!meta?.ok || !meta?.dataBytes || typeof meta.dataOffset !== 'number') {
+      if (ctx?.tabId) {
+        sendDebugLog(ctx.tabId, ctx.messageId, `Skipping audio window ${i + 1}: invalid WAV metadata (${meta?.reason || 'unknown'})`, 'warn');
+      }
+      continue;
+    }
+    if (!baseFmt) {
+      baseFmt = meta.fmt;
+    } else if (
+      meta.fmt?.sampleRate !== baseFmt.sampleRate ||
+      meta.fmt?.channels !== baseFmt.channels ||
+      meta.fmt?.bitsPerSample !== baseFmt.bitsPerSample
+    ) {
+      if (ctx?.tabId) {
+        sendDebugLog(ctx.tabId, ctx.messageId, `Skipping audio window ${i + 1}: format mismatch (${meta.fmt?.sampleRate || '?'}Hz ${meta.fmt?.channels || '?'}ch ${meta.fmt?.bitsPerSample || '?'}b)`, 'warn');
+      }
+      continue;
+    }
+    const u8 = await toUint8(src);
+    if (!u8 || u8.byteLength < meta.dataOffset + meta.dataBytes) {
+      if (ctx?.tabId) {
+        sendDebugLog(ctx.tabId, ctx.messageId, `Skipping audio window ${i + 1}: unexpected buffer size`, 'warn');
+      }
+      continue;
+    }
+    const slice = u8.subarray(meta.dataOffset, meta.dataOffset + meta.dataBytes);
+    chunks.push(slice);
+    totalDataBytes += slice.byteLength;
+  }
+
+  if (!chunks.length || !baseFmt) {
+    throw new Error('No usable audio windows to combine');
+  }
+
+  const channels = baseFmt.channels || 1;
+  const bitsPerSample = baseFmt.bitsPerSample || 16;
+  const sampleRate = baseFmt.sampleRate || 16000;
+  const headerSize = 44;
+  const frameBytes = Math.max(1, channels * Math.max(1, bitsPerSample) / 8);
+  const buffer = new ArrayBuffer(headerSize + totalDataBytes);
+  const view = new DataView(buffer);
+  const out = new Uint8Array(buffer);
+
+  out.set([82, 73, 70, 70], 0); // 'RIFF'
+  view.setUint32(4, headerSize - 8 + totalDataBytes, true);
+  out.set([87, 65, 86, 69], 8); // 'WAVE'
+  out.set([102, 109, 116, 32], 12); // 'fmt '
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, channels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * channels * (bitsPerSample / 8), true);
+  view.setUint16(32, channels * (bitsPerSample / 8), true);
+  view.setUint16(34, bitsPerSample, true);
+  out.set([100, 97, 116, 97], 36); // 'data'
+  view.setUint32(40, totalDataBytes, true);
+
+  let offset = headerSize;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  const durationMs = sampleRate ? Math.round((totalDataBytes / frameBytes) / sampleRate * 1000) : null;
+  return { blob: new Blob([buffer], { type: 'audio/wav' }), bytes: buffer.byteLength, durationMs };
 }
 
 function summarizeWavDiagnostics(diagnostics) {
@@ -3541,6 +3855,287 @@ function detectAndApplyOffset(srtContent) {
   return offsetSubtitles(srtContent, detectedOffset);
 }
 
+const READABLE_SRT_MAX_LINE = 42;
+const READABLE_SRT_MAX_LINES = 2;
+const READABLE_SRT_MAX_CHARS = READABLE_SRT_MAX_LINE * READABLE_SRT_MAX_LINES;
+const READABLE_SRT_MIN_MS = 800;
+const READABLE_SRT_MAX_MS = 7500;
+const READABLE_SRT_CPS_DEFAULT = 16;
+const READABLE_SRT_CPS_SLOW = 12; // For denser languages like CJK
+const READABLE_PAUSE_SPLIT_MS = 450;
+const READABLE_GAP_ABSORB_MS = 400;
+const READABLE_OVERLAP_TOLERANCE_MS = 120;
+
+function cueCpsForLanguage(lang = '') {
+  const lc = String(lang || '').toLowerCase();
+  if (!lc) return READABLE_SRT_CPS_DEFAULT;
+  if (['ja', 'jpn', 'zh', 'zho', 'ko', 'kor'].some((k) => lc.startsWith(k))) {
+    return READABLE_SRT_CPS_SLOW;
+  }
+  return READABLE_SRT_CPS_DEFAULT;
+}
+
+function detectSpeakerId(seg) {
+  return seg?.speaker || seg?.speakerId || seg?.speaker_id || seg?.spk || seg?.spkr || null;
+}
+
+function stripSpeakerPrefix(text = '') {
+  if (!text) return text;
+  const pattern = /^\s*(?:<v\s+[^>]+>\s*)?(?:speaker|spk|spkr|voice)\s*[._\-\s]*[0-9a-z]*\s*[:.)\]-]?\s*/i;
+  return text.replace(pattern, '').replace(/<\/v>\s*$/i, '').trim();
+}
+
+function normalizeTranscriptSegment(seg) {
+  if (!seg) return null;
+  const startSec = Number(seg.start ?? seg.start_time ?? (seg.startMs ?? 0) / 1000) || 0;
+  const endSecRaw = Number(seg.end ?? seg.end_time ?? (seg.endMs ?? 0) / 1000);
+  const endSec = Number.isFinite(endSecRaw) ? endSecRaw : (startSec + 4);
+  const startMs = Math.max(0, Number.isFinite(seg.startMs) ? Math.round(seg.startMs) : Math.round(startSec * 1000));
+  let endMs = Number.isFinite(seg.endMs) ? Math.round(seg.endMs) : Math.round(endSec * 1000);
+  if (!Number.isFinite(endMs) || endMs <= startMs) {
+    endMs = startMs + READABLE_SRT_MIN_MS;
+  }
+  const text = stripSpeakerPrefix((seg.text || seg.transcript || '').toString().replace(/\s+/g, ' ').trim());
+  if (!text) return null;
+  return {
+    startMs,
+    endMs: Math.max(startMs + 300, endMs),
+    text,
+    speaker: detectSpeakerId(seg),
+    language: seg.language || seg.lang || '',
+    words: Array.isArray(seg.words) ? seg.words : null
+  };
+}
+
+function splitTextIntoChunks(text, seg = null) {
+  const cleaned = (text || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return [];
+  const sentences = cleaned.split(/(?<=[\.?!])\s+(?=[A-Z0-9\[\("'])/);
+  const pieces = [];
+  const pushChunk = (chunk) => {
+    const trimmed = (chunk || '').trim();
+    if (trimmed) pieces.push(trimmed);
+  };
+  const splitLong = (input) => {
+    const words = input.split(/\s+/);
+    const chunks = [];
+    let buf = [];
+    let len = 0;
+    for (const word of words) {
+      const extra = (len ? 1 : 0) + word.length;
+      if (len && len + extra > READABLE_SRT_MAX_CHARS && len >= READABLE_SRT_MAX_CHARS * 0.6) {
+        chunks.push(buf.join(' '));
+        buf = [word];
+        len = word.length;
+      } else {
+        buf.push(word);
+        len += extra;
+      }
+    }
+    if (buf.length) chunks.push(buf.join(' '));
+    return chunks;
+  };
+
+  for (const sentence of sentences) {
+    const trimmed = (sentence || '').trim();
+    if (!trimmed) continue;
+    if (trimmed.length > READABLE_SRT_MAX_CHARS * 1.25) {
+      splitLong(trimmed).forEach(pushChunk);
+    } else {
+      pushChunk(trimmed);
+    }
+  }
+
+  const merged = [];
+  for (const piece of pieces) {
+    if (!merged.length) {
+      merged.push(piece);
+      continue;
+    }
+    const prev = merged[merged.length - 1];
+    if (prev.length + 1 + piece.length <= READABLE_SRT_MAX_CHARS * 0.9) {
+      merged[merged.length - 1] = `${prev} ${piece}`;
+    } else {
+      merged.push(piece);
+    }
+  }
+
+  const hasWordTiming = Array.isArray(seg?.words) && seg.words.some((w) => Number.isFinite(w?.start) || Number.isFinite(w?.end) || Number.isFinite(w?.startMs) || Number.isFinite(w?.endMs));
+  if (!hasWordTiming) return merged;
+
+  const pauseBreaks = [];
+  const words = seg.words
+    .map((w) => {
+      const wStart = Number.isFinite(w?.startMs) ? w.startMs : Number(w?.start || 0) * 1000;
+      const wEnd = Number.isFinite(w?.endMs) ? w.endMs : Number(w?.end || 0) * 1000;
+      const wText = w?.text || w?.word || '';
+      return { ...w, startMs: wStart, endMs: wEnd, text: wText };
+    })
+    .filter((w) => Number.isFinite(w.startMs) && Number.isFinite(w.endMs) && w.endMs > w.startMs);
+  for (let i = 1; i < words.length; i++) {
+    const gap = words[i].startMs - words[i - 1].endMs;
+    if (gap >= READABLE_PAUSE_SPLIT_MS) {
+      pauseBreaks.push(words[i - 1].text || '');
+    }
+  }
+  if (!pauseBreaks.length) return merged;
+
+  const rebroken = [];
+  for (const chunk of merged) {
+    let buffer = '';
+    const localWords = chunk.split(/\s+/);
+    for (const w of localWords) {
+      const candidate = buffer ? `${buffer} ${w}` : w;
+      buffer = candidate;
+      if (pauseBreaks.includes(w) || buffer.length >= READABLE_SRT_MAX_CHARS * 0.9) {
+        rebroken.push(buffer);
+        buffer = '';
+      }
+    }
+    if (buffer) rebroken.push(buffer);
+  }
+  return rebroken;
+}
+
+function wrapCueLines(text, maxLine = READABLE_SRT_MAX_LINE, maxLines = READABLE_SRT_MAX_LINES) {
+  const words = (text || '').split(/\s+/).filter(Boolean);
+  if (!words.length) return '';
+  const lines = [];
+  let current = '';
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (candidate.length > maxLine && current) {
+      lines.push(current);
+      current = word;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) lines.push(current);
+
+  if (lines.length <= maxLines) return lines.join('\n');
+
+  const targetLen = Math.max(maxLine, Math.ceil(words.join(' ').length / maxLines));
+  const reflow = [];
+  current = '';
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (candidate.length > targetLen && current) {
+      reflow.push(current);
+      current = word;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) reflow.push(current);
+
+  while (reflow.length > maxLines) {
+    const tail = reflow.pop();
+    reflow[reflow.length - 1] = `${reflow[reflow.length - 1]} ${tail}`;
+  }
+  return reflow.join('\n');
+}
+
+function distributeCueTimings(chunks, startMs, endMs, lang = '') {
+  if (!Array.isArray(chunks) || !chunks.length) return [];
+  const spanMs = Math.max(READABLE_SRT_MIN_MS, endMs - startMs);
+  const cps = cueCpsForLanguage(lang);
+  let durations = chunks.map((c) => {
+    const idealMs = Math.max(READABLE_SRT_MIN_MS, (Math.max(c.length, 1) / cps) * 1000);
+    return Math.min(READABLE_SRT_MAX_MS, idealMs);
+  });
+
+  let total = durations.reduce((a, b) => a + b, 0);
+  if (total > spanMs) {
+    const factor = spanMs / total;
+    durations = durations.map((d) => Math.max(READABLE_SRT_MIN_MS * 0.6, d * factor));
+    total = durations.reduce((a, b) => a + b, 0);
+  }
+
+  let remaining = Math.max(0, spanMs - total);
+  if (remaining > 0) {
+    const headroom = durations.reduce((sum, d) => sum + Math.max(0, READABLE_SRT_MAX_MS - d), 0);
+    if (headroom > 0) {
+      const ratio = Math.min(1, remaining / headroom);
+      durations = durations.map((d) => d + Math.max(0, READABLE_SRT_MAX_MS - d) * ratio);
+      remaining = Math.max(0, spanMs - durations.reduce((a, b) => a + b, 0));
+    }
+    if (remaining > 0) {
+      durations[durations.length - 1] += remaining;
+    }
+  }
+
+  const timed = [];
+  let cursor = startMs;
+  for (let i = 0; i < chunks.length; i++) {
+    const dur = durations[i] || READABLE_SRT_MIN_MS;
+    const cueEnd = i === chunks.length - 1 ? endMs : Math.min(endMs, cursor + dur);
+    timed.push({ startMs: cursor, endMs: cueEnd, text: chunks[i] });
+    cursor = cueEnd;
+  }
+
+  if (timed.length) {
+    timed[timed.length - 1].endMs = Math.min(endMs, Math.max(timed[timed.length - 1].startMs + READABLE_SRT_MIN_MS, timed[timed.length - 1].endMs));
+  }
+  return timed;
+}
+
+function buildReadableCues(segments) {
+  const cues = [];
+  let lastEndMs = 0;
+
+  const normalized = (segments || [])
+    .map(normalizeTranscriptSegment)
+    .filter(Boolean)
+    .sort((a, b) => (a.startMs || 0) - (b.startMs || 0));
+
+  normalized.forEach((seg, idx) => {
+    const sameSpeakerAsPrev = idx > 0 && normalized[idx - 1].speaker && normalized[idx - 1].speaker === seg.speaker;
+    const gapFromLast = seg.startMs - lastEndMs;
+
+    // absorb micro gaps to keep flow tight, but keep clear separation on speaker switch
+    let segStart = seg.startMs;
+    if (gapFromLast <= READABLE_GAP_ABSORB_MS && gapFromLast >= 0) {
+      segStart = sameSpeakerAsPrev ? Math.max(seg.startMs, lastEndMs) : lastEndMs;
+    } else if (gapFromLast < 0) {
+      segStart = lastEndMs;
+    }
+
+    let segEnd = Math.max(segStart + READABLE_SRT_MIN_MS, seg.endMs);
+
+    const chunks = splitTextIntoChunks(seg.text, seg);
+    if (!chunks.length) return;
+    const timedChunks = distributeCueTimings(chunks, segStart, segEnd, seg.language);
+    for (const chunk of timedChunks) {
+      let cueStart = Math.max(chunk.startMs, lastEndMs);
+      let cueEnd = Math.min(segEnd, Math.max(cueStart + 300, chunk.endMs));
+      if (cueEnd <= cueStart) {
+        cueEnd = cueStart + READABLE_SRT_MIN_MS;
+      }
+      cues.push({
+        startMs: cueStart,
+        endMs: cueEnd,
+        text: wrapCueLines(chunk.text)
+      });
+      lastEndMs = cueEnd;
+    }
+  });
+
+  // Final smoothing: ensure monotonic, trim tiny overlaps, and absorb sub-ms jitter
+  for (let i = 1; i < cues.length; i++) {
+    const prev = cues[i - 1];
+    const curr = cues[i];
+    if (curr.startMs < prev.endMs - READABLE_OVERLAP_TOLERANCE_MS) {
+      curr.startMs = prev.endMs;
+    }
+    if (curr.endMs <= curr.startMs) {
+      curr.endMs = curr.startMs + READABLE_SRT_MIN_MS;
+    }
+  }
+
+  return cues;
+}
+
 function convertVttToSrt(vttText) {
   if (!vttText) return '';
   let srt = String(vttText).replace(/^WEBVTT[^\n]*\n+/i, '');
@@ -3552,16 +4147,14 @@ function convertVttToSrt(vttText) {
 /**
  * Convert transcript segments (startMs/endMs/text) into SRT
  */
-function segmentsToSrt(segments) {
-  if (!Array.isArray(segments) || !segments.length) return '';
-  return segments.map((s, idx) => {
-    return [
-      String(idx + 1),
-      `${formatTime(Math.max(0, Math.round(s.startMs || 0)))} --> ${formatTime(Math.max(0, Math.round(s.endMs || s.startMs || 0)))}`,
-      (s.text || '').trim(),
-      ''
-    ].join('\n');
-  }).join('\n');
+function segmentsToReadableSrt(segments) {
+  const cues = buildReadableCues(Array.isArray(segments) ? segments : []);
+  if (!cues.length) return '';
+  return cues.map((cue, idx) => [
+    String(idx + 1),
+    `${formatTime(Math.max(0, Math.round(cue.startMs || 0)))} --> ${formatTime(Math.max(0, Math.round(cue.endMs || cue.startMs || 0)))}`,
+    (cue.text || '').trim()
+  ].join('\n')).join('\n\n');
 }
 
 /**
@@ -5472,7 +6065,15 @@ function normalizeBufferForTransfer(buffer) {
   if (!buffer) return null;
   if (buffer instanceof ArrayBuffer) return buffer;
   if (ArrayBuffer.isView(buffer)) {
-    return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+    const view = buffer;
+    // Reuse the original view when it already spans the full backing buffer to avoid cloning huge payloads.
+    if (view.byteOffset === 0 && view.byteLength === view.buffer.byteLength) {
+      return view;
+    }
+    // Otherwise trim to the view range (clone) to keep the payload scoped correctly.
+    return typeof view.slice === 'function'
+      ? view.slice()
+      : view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
   }
   if (buffer instanceof Blob) {
     return buffer;

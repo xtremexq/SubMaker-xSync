@@ -643,7 +643,7 @@ async function handleAutoSubRequest(message) {
     hasStreamUrl: !!message.data?.streamUrl
   });
 
-  const { streamUrl, filename, model, sourceLanguage, diarization } = message.data || {};
+  const { streamUrl, filename, model, sourceLanguage, diarization, useAssembly, assemblyApiKey, sendFullVideo } = message.data || {};
   const pageHeaders = {
     referer: window.location.href || null,
     cookie: document?.cookie || null,
@@ -669,6 +669,9 @@ async function handleAutoSubRequest(message) {
         diarization,
         cfAccountId: message.data?.cfAccountId || message.data?.accountId,
         cfToken: message.data?.cfToken || message.data?.token,
+        useAssembly: useAssembly === true,
+        assemblyApiKey: assemblyApiKey || '',
+        sendFullVideo: sendFullVideo === true,
         pageHeaders
       }
     }, 'auto-subtitles');

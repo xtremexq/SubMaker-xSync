@@ -2539,6 +2539,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           throw new Error('No audio windows provided for decode');
         }
 
+        // Some decode requests reuse the same transferId across multiple windows to avoid
+        // duplicating large buffers. Cache each loaded buffer so we only consume IDB/chunks once.
+        const bufferCache = new Map();
+
         const windows = [];
         for (let idx = 0; idx < rawWindows.length; idx++) {
           const w = rawWindows[idx];
@@ -2546,18 +2550,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const transferMethod = w?.transferMethod || (buf && buf.transferMethod);
           const transferId = w?.transferId || (buf && buf.transferId);
 
-          if (transferMethod === 'idb' && transferId) {
-            try {
-              buf = await SubMakerTransfer.loadTransferBuffer(transferId);
-              SubMakerTransfer.deleteTransferBuffer(transferId).catch(e => console.warn('Failed to delete transfer buffer', e));
-            } catch (err) {
-              throw new Error(`Failed to load IDB transfer buffer for window ${idx + 1}: ${err?.message || err}`);
+          const loadFromTransfer = async (id, method) => {
+            if (bufferCache.has(id)) {
+              return bufferCache.get(id);
             }
-          } else if (!buf && transferId) {
-            buf = consumeChunkedBuffer(transferId);
-          }
-          if (buf && buf.transferId) {
-            buf = consumeChunkedBuffer(buf.transferId);
+            let loaded = null;
+            if (method === 'idb') {
+              try {
+                loaded = await SubMakerTransfer.loadTransferBuffer(id);
+                SubMakerTransfer.deleteTransferBuffer(id).catch(e => console.warn('Failed to delete transfer buffer', e));
+              } catch (err) {
+                throw new Error(`Failed to load IDB transfer buffer for window ${idx + 1}: ${err?.message || err}`);
+              }
+            } else {
+              loaded = consumeChunkedBuffer(id);
+            }
+            const normalized = loaded instanceof Uint8Array ? loaded : (loaded ? new Uint8Array(loaded) : null);
+            if (normalized) {
+              bufferCache.set(id, normalized);
+            }
+            return normalized;
+          };
+
+          if (transferId) {
+            buf = await loadFromTransfer(transferId, transferMethod);
+          } else if (buf && buf.transferId) {
+            buf = await loadFromTransfer(buf.transferId, buf.transferMethod || transferMethod);
           }
           if (!buf) {
             throw new Error(`Missing buffer for window ${idx + 1}`);
