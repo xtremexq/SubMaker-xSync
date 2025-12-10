@@ -258,6 +258,15 @@ chrome.runtime.onMessage.addListener((msg) => {
       stage: msg.stage,
       level: msg.level
     });
+  } else if (msg?.type === 'AUTOSUB_TRACK_OPTIONS') {
+    sendToPage({
+      type: 'SUBMAKER_AUTOSUB_TRACKS',
+      source: 'extension',
+      messageId: msg.messageId,
+      tracks: msg.tracks || [],
+      suggestedIndex: msg.suggestedIndex,
+      extractedIndex: msg.extractedIndex
+    });
   } else if (msg?.type === 'AUTOSUB_RESPONSE') {
     sendToPage({
       type: 'SUBMAKER_AUTOSUB_RESPONSE',
@@ -432,6 +441,10 @@ async function handlePageMessage(event) {
 
       case 'SUBMAKER_AUTOSUB_REQUEST':
         await handleAutoSubRequest(message);
+        break;
+
+      case 'SUBMAKER_AUTOSUB_SELECT_TRACK':
+        await handleAutoSubTrackSelection(message);
         break;
 
       case 'SUBMAKER_EMBEDDED_RESET':
@@ -643,7 +656,7 @@ async function handleAutoSubRequest(message) {
     hasStreamUrl: !!message.data?.streamUrl
   });
 
-  const { streamUrl, filename, model, sourceLanguage, diarization, useAssembly, assemblyApiKey, sendFullVideo } = message.data || {};
+  const { streamUrl, filename, model, sourceLanguage, diarization, useAssembly, assemblyApiKey, sendFullVideo, cfWindowSizeMb } = message.data || {};
   const pageHeaders = {
     referer: window.location.href || null,
     cookie: document?.cookie || null,
@@ -667,11 +680,13 @@ async function handleAutoSubRequest(message) {
         model,
         sourceLanguage,
         diarization,
+        audioTrackIndex: message.data?.audioTrackIndex,
         cfAccountId: message.data?.cfAccountId || message.data?.accountId,
         cfToken: message.data?.cfToken || message.data?.token,
         useAssembly: useAssembly === true,
         assemblyApiKey: assemblyApiKey || '',
         sendFullVideo: sendFullVideo === true,
+        cfWindowSizeMb: cfWindowSizeMb,
         pageHeaders
       }
     }, 'auto-subtitles');
@@ -684,6 +699,21 @@ async function handleAutoSubRequest(message) {
       success: false,
       error: error.message || 'Auto-subtitles failed'
     });
+  }
+}
+
+/**
+ * Handle audio track selection from webpage for paused auto-sub flow
+ */
+async function handleAutoSubTrackSelection(message) {
+  try {
+    await sendRuntimeMessage({
+      type: 'AUTOSUB_SELECT_TRACK',
+      messageId: message.messageId,
+      trackIndex: message.trackIndex
+    }, 'auto-subtitles-select-track');
+  } catch (error) {
+    console.error('[SubMaker xSync] Auto-sub track selection failed to forward:', error);
   }
 }
 

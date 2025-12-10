@@ -989,7 +989,8 @@ async function runCloudflareTranscription(audioBlob, opts = {}, ctx = null) {
   const model = (opts.model || '@cf/openai/whisper').trim();
   const endpoint = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${encodeURI(model)}`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 60000);
+  const timeoutMs = typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0 ? opts.timeoutMs : 60000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   const audioBuffer = await audioBlob.arrayBuffer();
   const contentType = audioBlob?.type || 'audio/wav';
   let response;
@@ -1174,7 +1175,19 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
     lastBody = detectRes.cfBody || lastBody;
     detectedLang = detectRes.language || '';
     forcedLang = detectRes.language || forcedLang || null;
-    const segs = Array.isArray(detectRes.segments) ? detectRes.segments : [];
+    let segs = Array.isArray(detectRes.segments) ? detectRes.segments : [];
+    const fallbackText =
+      (detectRes.raw && (detectRes.raw.text || detectRes.raw.transcript)) || '';
+    if (!segs.length && fallbackText) {
+      const winDurSec = Number.isFinite(firstWin?.durSec)
+        ? firstWin.durSec
+        : (Number.isFinite(firstWin?.durMs) ? firstWin.durMs / 1000 : 5);
+      segs = [{
+        start: 0,
+        end: winDurSec || 5,
+        text: fallbackText
+      }];
+    }
     const adjusted = segs.map((seg) => ({
       ...seg,
       start: (seg.start || seg.start_time || 0) + offsetSec,
@@ -1182,13 +1195,17 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
     }));
     allSegments.push(...adjusted);
     if (ctx?.tabId) {
-      sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare detect complete (${segs.length} segments, lang=${detectRes.language || 'n/a'})`, 'info');
-      if (!segs.length) {
-        sendDebugLog(ctx.tabId, ctx.messageId, 'First window returned no segments; retrying with per-window autodetect for all windows.', 'warn');
+      sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare detect complete (${segs.length} segments, lang=${detectRes.language || forcedLang || 'n/a'})`, 'info');
+      if (!Array.isArray(detectRes.segments) || !detectRes.segments.length) {
+        if (fallbackText) {
+          sendDebugLog(ctx.tabId, ctx.messageId, 'Cloudflare detect returned text-only output (no segments); synthesizing a single segment from text.', 'info');
+        } else {
+          sendDebugLog(ctx.tabId, ctx.messageId, 'First window returned no segments; retrying with per-window autodetect for all windows.', 'warn');
+        }
       }
     }
     // If detection produced no segments, retry window 1 in the main loop so it also benefits from the per-window autodetect order.
-    startIdx = segs.length ? 1 : 0;
+    startIdx = Array.isArray(detectRes.segments) && detectRes.segments.length ? 1 : 0;
   }
 
   if (!forcedLang) {
@@ -1221,37 +1238,70 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
     let res = null;
     let lastErr = null;
     for (const lang of langOrder) {
-      try {
-        res = await runCloudflareTranscription(win.audioBlob, {
-          accountId: opts.accountId,
-          token: opts.token,
-          model: opts.model,
-          sourceLanguage: lang || undefined,
-          diarization: opts.diarization,
-          filename: opts.filename ? `${opts.filename}_${i + 1}.wav` : `audio_${i + 1}.wav`,
-          forceJson: !!lang
-        }, ctx);
-        forcedLang = lang || forcedLang; // stick with the last successful language (still allow auto attempts next window)
-        break;
-      } catch (err) {
-        lastErr = err;
-        const msg = (err?.message || '').toLowerCase();
-        const needsSwitch = msg.includes('different language') || msg.includes('unsupported audio input') || msg.includes('language');
-        if (!needsSwitch) {
-          throw err;
-        }
-        if (ctx?.tabId) {
-          sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare window ${i + 1} failed for lang=${lang || 'auto'}: ${err?.message || err}`, 'warn');
+      const maxRetries = 2;
+      let attempt = 0;
+      while (attempt <= maxRetries) {
+        try {
+          res = await runCloudflareTranscription(win.audioBlob, {
+            accountId: opts.accountId,
+            token: opts.token,
+            model: opts.model,
+            sourceLanguage: lang || undefined,
+            diarization: opts.diarization,
+            filename: opts.filename ? `${opts.filename}_${i + 1}.wav` : `audio_${i + 1}.wav`,
+            forceJson: !!lang
+          }, ctx);
+          forcedLang = lang || forcedLang; // stick with the last successful language (still allow auto attempts next window)
+          if (attempt > 0 && ctx?.tabId) {
+            sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare window ${i + 1} succeeded on retry attempt ${attempt + 1} for lang=${lang || 'auto'}.`, 'info');
+          }
+          break;
+        } catch (err) {
+          lastErr = err;
+          const msg = (err?.message || '').toLowerCase();
+          const needsSwitch = msg.includes('different language') || msg.includes('unsupported audio input') || msg.includes('language');
+          const isTimeout = msg.includes('timed out');
+          const isNetworkish = msg.includes('network') || msg.includes('failed to fetch') || msg.includes('fetch failed');
+          const retryable = isTimeout || isNetworkish;
+          if (retryable && attempt < maxRetries) {
+            attempt += 1;
+            if (ctx?.tabId) {
+              sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare window ${i + 1} attempt ${attempt} failed (${err?.message || err}); retrying (retry ${attempt} of ${maxRetries}) for lang=${lang || 'auto'}...`, 'warn');
+            }
+            continue;
+          }
+          if (!needsSwitch) {
+            throw err;
+          }
+          if (ctx?.tabId) {
+            sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare window ${i + 1} failed for lang=${lang || 'auto'}: ${err?.message || err}`, 'warn');
+          }
+          break;
         }
       }
-    }
+      }
     if (!res) {
       throw lastErr || new Error('Cloudflare transcription failed for all language attempts');
     }
     lastStatus = res.status || lastStatus;
     lastBody = res.cfBody || lastBody;
     detectedLang = res.language || detectedLang || forcedLang || '';
-    const segs = Array.isArray(res.segments) ? res.segments : [];
+    let segs = Array.isArray(res.segments) ? res.segments : [];
+    const fallbackText =
+      (res.raw && (res.raw.text || res.raw.transcript)) || '';
+    if (!segs.length && fallbackText) {
+      const winDurSec = Number.isFinite(win?.durSec)
+        ? win.durSec
+        : (Number.isFinite(win?.durMs) ? win.durMs / 1000 : 5);
+      segs = [{
+        start: 0,
+        end: winDurSec || 5,
+        text: fallbackText
+      }];
+      if (ctx?.tabId) {
+        sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare window ${i + 1} produced text-only output; synthesizing a single segment from text.`, 'info');
+      }
+    }
     const adjusted = segs.map((seg) => ({
       ...seg,
       start: (seg.start || seg.start_time || 0) + offsetSec,
@@ -1320,6 +1370,12 @@ function __xsyncHandleMessage(message, sender, sendResponse) {
         extracting: activeExtractJobs.size
       });
       return false; // synchronous response
+    }
+
+    if (message?.type === 'AUTOSUB_SELECT_TRACK') {
+      const ok = resolveAutoSubTrackChoice(message?.messageId, message?.trackIndex);
+      reply({ success: ok, resolved: ok });
+      return false;
     }
 
     if (message?.type === 'SYNC_REQUEST') {
@@ -1956,6 +2012,7 @@ async function handleAutoSubRequest(message, tabId) {
   const cfToken = data.cfToken || data.token;
   const model = data.model || '@cf/openai/whisper';
   let sourceLanguage = (data.sourceLanguage || data.language || '').trim();
+  const requestedTrackIndex = Number.isInteger(data.audioTrackIndex) ? data.audioTrackIndex : null;
   const diarization = data.diarization === true;
   const pageHeaders = data.pageHeaders || null;
   const ctx = { tabId, messageId, pageHeaders };
@@ -1970,7 +2027,15 @@ async function handleAutoSubRequest(message, tabId) {
   try {
     const host = (() => { try { return new URL(streamUrl || '').hostname; } catch (_) { return streamUrl || ''; } })();
     sendDebugLog(tabId, messageId, `Auto-sub request received (model=${model}, diarization=${diarization}) host=${host || 'n/a'}`, 'info');
-    const cfWindowCapSec = 90; // ~2.9 MB at 16k/16-bit mono, keeps well below Cloudflare's effective payload guard
+    const rawWindowMb = typeof data.cfWindowSizeMb === 'number' ? data.cfWindowSizeMb : parseFloat(data.cfWindowSizeMb);
+    const cfWindowMb = Number.isFinite(rawWindowMb) && rawWindowMb > 0 ? Math.min(Math.max(rawWindowMb, 1), 25) : null;
+    const cfWindowCapSec = (() => {
+      if (!cfWindowMb) return 90; // default ~2.9 MB at 16k/16-bit mono (~90s)
+      const bytes = cfWindowMb * 1024 * 1024;
+      const bytesPerSecond = 32000; // 16kHz * 16-bit mono
+      const seconds = Math.round(bytes / bytesPerSecond);
+      return Math.min(Math.max(seconds, 15), 600); // clamp between 15s and 10min
+    })();
     const planInput = {
       preset: 'complete',
       fullScan: true,
@@ -1982,87 +2047,79 @@ async function handleAutoSubRequest(message, tabId) {
       maxChunkSeconds: cfWindowCapSec
     };
 
-    const buildBaseHeaders = (fromPageHeaders) => {
-      const h = fromPageHeaders || {};
-      const headers = {};
-      if (h.referer) headers.Referer = h.referer;
-      if (h.cookie) headers.Cookie = h.cookie;
-      if (h.userAgent) headers['User-Agent'] = h.userAgent;
-      return Object.keys(headers).length ? headers : null;
-    };
-
-    const baseHeaders = buildBaseHeaders(pageHeaders);
-
-    const pickPreferredTrack = (tracks, langHint) => {
-      if (!Array.isArray(tracks) || !tracks.length) return { preferred: null, ordered: [] };
-      const normalize = (l) => (l || '').split('-')[0].toLowerCase();
-      const hint = normalize(langHint || '');
-      const ordered = [...tracks];
-      const byHint = hint ? ordered.find(t => normalize(t.language) === hint) : null;
-      const byEn = ordered.find(t => normalize(t.language) === 'en');
-      const preferred = byHint || byEn || ordered[0];
-      return { preferred, ordered };
-    };
-
-    const probeAudioTracks = async () => {
-      try {
-        const sample = await fetchByteRangeSample(
-          streamUrl,
-          () => { },
-          { minBytes: 12 * 1024 * 1024, maxBytesCap: 64 * 1024 * 1024 },
-          baseHeaders
-        );
-        const headerInfo = parseMkvHeaderInfo(sample.buffer, { maxScanBytes: Math.min(sample.buffer.byteLength, 12 * 1024 * 1024) });
-        const audioTracks = (headerInfo?.tracks || [])
-          .filter(t => t.type === 0x02 || t.type === 2)
-          .map((t, idx) => ({
-            index: idx,
-            trackNumber: typeof t.number === 'number' ? t.number : idx + 1,
-            language: (t.language || '').trim(),
-            name: t.name || '',
-            codec: t.codecId || ''
-          }));
-        return audioTracks;
-      } catch (err) {
-        console.warn('[Background] Audio track probe failed:', err?.message || err);
-        if (tabId) {
-          sendDebugLog(tabId, messageId, `Audio track probe failed: ${err?.message || err}`, 'warn');
-        }
-        return [];
-      }
-    };
-
     const isMixedLangError = (err) => {
       const msg = (err?.message || '').toLowerCase();
       return msg.includes('different language') || msg.includes('unsupported audio input') || msg.includes('language');
     };
 
-    const audioTracks = await probeAudioTracks();
+    const audioTracks = await probeAudioTracksFromStream(streamUrl, pageHeaders, ctx);
     if (audioTracks.length) {
       const trackSummaries = audioTracks.map(t => `#${t.trackNumber || t.index + 1}${t.language ? `(${t.language})` : ''}${t.name ? ` ${t.name}` : ''}`).join(' | ');
       sendDebugLog(tabId, messageId, `Detected audio tracks: ${trackSummaries}`, 'info');
     }
-    const { preferred, ordered } = pickPreferredTrack(audioTracks, sourceLanguage || 'en');
+    const { preferred, ordered } = pickPreferredAudioTrack(audioTracks, sourceLanguage || 'en');
     if (!sourceLanguage && preferred?.language) {
       sourceLanguage = preferred.language;
     }
 
-    const attemptAutoSub = async (audioStreamIndex) => {
-      sendAutoSubProgress(tabId, messageId, 5, `Preparing pipeline (audio track ${audioStreamIndex + 1})...`, 'init');
-      sendAutoSubProgress(tabId, messageId, 8, 'Fetching stream...', 'fetch');
-      const audioWindows = await extractAudioFromStream(
-        streamUrl,
-        planInput,
-        (p, status) => {
-          // Only log a label when provided; otherwise just advance progress to avoid spamming the same text.
-          sendAutoSubProgress(tabId, messageId, Math.min(60, Math.round(p)), status || null, 'fetch');
-        },
-        ctx,
-        { audioStreamIndex }
-      );
-      sendAutoSubProgress(tabId, messageId, 65, 'Audio ready. Sending to Cloudflare...', 'transcribe');
-      sendDebugLog(tabId, messageId, `Audio ready; forwarding ${audioWindows.length} window(s) to Cloudflare (audio track ${audioStreamIndex + 1}, lang=${sourceLanguage || 'auto'})`, 'info');
+    let userSelectedTrack = requestedTrackIndex !== null;
+    let initialTrackIndex = requestedTrackIndex;
+
+    // If the page didn't explicitly request a track and we have multiple,
+    // ask the user to choose before doing any heavy extraction.
+    if (!userSelectedTrack && ordered && ordered.length > 1) {
+      const defaultIdx = preferred ? preferred.index : (ordered[0]?.index ?? 0);
+      sendAutoSubTrackOptions(tabId, messageId, ordered, defaultIdx, defaultIdx);
+      sendAutoSubProgress(tabId, messageId, 6, 'Multiple audio tracks detected. Choose one to continue.', 'select-track');
+      const choice = await awaitAutoSubTrackChoice(messageId, defaultIdx, ordered);
+      const normalized = Number.isInteger(choice) && choice >= 0 ? choice : defaultIdx;
+      initialTrackIndex = normalized;
+      userSelectedTrack = true;
+    }
+
+    if (!Number.isInteger(initialTrackIndex)) {
+      if (preferred && Number.isInteger(preferred.index)) {
+        initialTrackIndex = preferred.index;
+      } else if (audioTracks.length && Number.isInteger(audioTracks[0]?.index)) {
+        initialTrackIndex = audioTracks[0].index;
+      } else {
+        initialTrackIndex = 0;
+      }
+    }
+
+    const streamAttempts = (() => {
+      if (userSelectedTrack && Number.isInteger(initialTrackIndex)) {
+        return [initialTrackIndex];
+      }
+      if (preferred && Number.isInteger(preferred.index)) {
+        const others = (ordered || []).filter(t => t.index !== preferred.index).map(t => t.index);
+        return [preferred.index, ...others];
+      }
+      return [initialTrackIndex];
+    })();
+    let lastErr = null;
+    for (let i = 0; i < streamAttempts.length; i++) {
+      let audioStreamIndex = streamAttempts[i];
       try {
+        const extractForTrack = async (idx, statusOverride = '') => {
+          const status = statusOverride || `Preparing pipeline (audio track ${idx + 1})...`;
+          sendAutoSubProgress(tabId, messageId, 5, status, 'init');
+          sendAutoSubProgress(tabId, messageId, 8, 'Fetching stream...', 'fetch');
+          const audioWindows = await extractAudioFromStream(
+            streamUrl,
+            planInput,
+            (p, statusText) => {
+              sendAutoSubProgress(tabId, messageId, Math.min(60, Math.round(p)), statusText || null, 'fetch');
+            },
+            ctx,
+            { audioStreamIndex: idx }
+          );
+          sendAutoSubProgress(tabId, messageId, 65, `Audio ready (track ${idx + 1}).`, 'fetch');
+          sendDebugLog(tabId, messageId, `Audio ready; forwarding ${audioWindows.length} window(s) to Cloudflare (audio track ${idx + 1}, lang=${sourceLanguage || 'auto'})`, 'info');
+          return audioWindows;
+        };
+
+        const audioWindows = await extractForTrack(audioStreamIndex);
         const transcript = await transcribeWindowsWithCloudflare(
           audioWindows,
           { accountId: cfAccountId, token: cfToken, model, sourceLanguage, diarization, filename: data.filename || 'audio' },
@@ -2073,28 +2130,12 @@ async function handleAutoSubRequest(message, tabId) {
         sendDebugLog(tabId, messageId, `Transcript ready (segments=${transcript.segmentCount || '?'}, lang=${transcript.languageCode || 'und'})`, 'info');
         const payload = { success: true, ...transcript };
         sendAutoSubResult(tabId, messageId, payload);
+        clearAutoSubTrackChoice(messageId);
         return payload;
-      } catch (cfErr) {
-        sendDebugLog(tabId, messageId, `Cloudflare transcription failed: ${cfErr?.message || cfErr}`, 'error');
-        throw cfErr;
-      }
-    };
-
-    const streamAttempts = (() => {
-      if (preferred) {
-        const others = ordered.filter(t => t.index !== preferred.index).map(t => t.index);
-        return [preferred.index, ...others];
-      }
-      return [0, 1];
-    })();
-    let lastErr = null;
-    for (let i = 0; i < streamAttempts.length; i++) {
-      try {
-        return await attemptAutoSub(streamAttempts[i]);
       } catch (err) {
         lastErr = err;
-        if (isMixedLangError(err) && i < streamAttempts.length - 1) {
-          sendDebugLog(tabId, messageId, `Cloudflare rejected audio track ${streamAttempts[i] + 1} as mixed-language; retrying with track ${streamAttempts[i + 1] + 1}...`, 'warn');
+        if (!userSelectedTrack && isMixedLangError(err) && i < streamAttempts.length - 1) {
+          sendDebugLog(tabId, messageId, `Cloudflare rejected audio track ${audioStreamIndex + 1} as mixed-language; retrying with track ${streamAttempts[i + 1] + 1}...`, 'warn');
           continue;
         }
         throw err;
@@ -2102,6 +2143,7 @@ async function handleAutoSubRequest(message, tabId) {
     }
     if (lastErr) throw lastErr;
   } catch (error) {
+    clearAutoSubTrackChoice(messageId);
     console.error('[Background] Auto-sub request failed:', error);
     const msg = error?.message || 'Auto-subtitles failed';
     sendDebugLog(tabId, messageId, `Auto-sub failed: ${msg}${error?.stack ? ` | stack: ${error.stack.slice(0, 400)}` : ''}`, 'error');
@@ -2221,6 +2263,7 @@ async function handleAssemblyAutoSubRequest(message, tabId) {
   const streamUrl = data.streamUrl;
   const apiKey = (data.assemblyApiKey || '').trim();
   let sourceLanguage = (data.sourceLanguage || data.language || '').trim();
+  const requestedTrackIndex = Number.isInteger(data.audioTrackIndex) ? data.audioTrackIndex : null;
   const diarization = data.diarization === true;
   const sendFullVideo = data.sendFullVideo === true;
   const pageHeaders = data.pageHeaders || null;
@@ -2233,14 +2276,39 @@ async function handleAssemblyAutoSubRequest(message, tabId) {
   const progress = (pct, status, stage = 'info', level = 'info') => sendAutoSubProgress(tabId, messageId, pct, status, stage, level);
 
   try {
-    const baseHeaders = (() => {
-      const h = pageHeaders || {};
-      const headers = {};
-      if (h.referer) headers['Referer'] = h.referer;
-      if (h.cookie) headers['Cookie'] = h.cookie;
-      if (h.userAgent) headers['User-Agent'] = h.userAgent;
-      return Object.keys(headers).length ? headers : null;
-    })();
+    const baseHeaders = buildHeadersFromPage(pageHeaders);
+    const audioTracks = await probeAudioTracksFromStream(streamUrl, pageHeaders, ctx);
+    if (audioTracks.length) {
+      const trackSummaries = audioTracks.map(t => `#${t.trackNumber || t.index + 1}${t.language ? `(${t.language})` : ''}${t.name ? ` ${t.name}` : ''}`).join(' | ');
+      logToPage(`Detected audio tracks: ${trackSummaries}`, 'info');
+    }
+    const { preferred, ordered } = pickPreferredAudioTrack(audioTracks, sourceLanguage || 'en');
+    if (!sourceLanguage && preferred?.language) {
+      sourceLanguage = preferred.language;
+    }
+
+    let audioTrackIndex = Number.isInteger(requestedTrackIndex) ? requestedTrackIndex : null;
+    let userSelectedTrack = audioTrackIndex !== null;
+    if (!userSelectedTrack && ordered && ordered.length > 1) {
+      const defaultIdx = preferred && Number.isInteger(preferred.index)
+        ? preferred.index
+        : (ordered[0]?.index ?? 0);
+      sendAutoSubTrackOptions(tabId, messageId, ordered, defaultIdx, defaultIdx);
+      progress(6, 'Multiple audio tracks detected. Choose one to continue.', 'select-track');
+      const choice = await awaitAutoSubTrackChoice(messageId, defaultIdx, ordered);
+      const normalized = Number.isInteger(choice) && choice >= 0 ? choice : defaultIdx;
+      audioTrackIndex = normalized;
+      userSelectedTrack = true;
+    }
+    if (!Number.isInteger(audioTrackIndex)) {
+      if (preferred && Number.isInteger(preferred.index)) {
+        audioTrackIndex = preferred.index;
+      } else if (audioTracks.length && Number.isInteger(audioTracks[0]?.index)) {
+        audioTrackIndex = audioTracks[0].index;
+      } else {
+        audioTrackIndex = 0;
+      }
+    }
 
     progress(5, 'Preparing AssemblyAI pipeline...', 'fetch');
     const isHls = /\.m3u8(\?|$)/i.test(streamUrl);
@@ -2268,13 +2336,17 @@ async function handleAssemblyAutoSubRequest(message, tabId) {
         requestedWindowSeconds: 6 * 3600,
         maxChunkSeconds: 6 * 3600
       };
-      const audioWindows = await extractAudioFromStream(
-        streamUrl,
-        planInput,
-        (p, status) => progress(Math.min(70, Math.round(p)), status || 'Extracting audio...', 'fetch'),
-        ctx,
-        {}
-      );
+      const extractForTrack = async (idx, statusText = '') => {
+        const label = statusText || `Extracting audio (track ${idx + 1})...`;
+        return await extractAudioFromStream(
+          streamUrl,
+          planInput,
+          (p, status) => progress(Math.min(70, Math.round(p)), status || label, 'fetch'),
+          ctx,
+          { audioStreamIndex: idx }
+        );
+      };
+      let audioWindows = await extractForTrack(audioTrackIndex);
       if (!audioWindows || !audioWindows.length) {
         throw new Error('Audio extraction returned no audio blob');
       }
@@ -2335,10 +2407,12 @@ async function handleAssemblyAutoSubRequest(message, tabId) {
     const payload = { success: true, transcript: transcriptPayload, ...transcriptPayload };
     sendAutoSubResult(tabId, messageId, payload);
     progress(100, 'AssemblyAI transcription complete', 'package', 'success');
+    clearAutoSubTrackChoice(messageId);
     return payload;
   } catch (error) {
     progress(100, `AssemblyAI failed: ${error?.message || error}`, 'error', 'error');
     sendAutoSubResult(tabId, messageId, { success: false, error: error?.message || 'AssemblyAI transcription failed' });
+    clearAutoSubTrackChoice(messageId);
     return { success: false, error: error?.message || 'AssemblyAI transcription failed' };
   }
 }
@@ -4306,6 +4380,102 @@ function sendAutoSubResult(tabId, messageId, payload) {
   }).catch(err => {
     console.error('[Background] Failed to send auto-sub result:', err);
   });
+}
+
+const pendingAutoSubTrackChoices = new Map();
+function clearAutoSubTrackChoice(messageId) {
+  const entry = pendingAutoSubTrackChoices.get(messageId);
+  if (!entry) return;
+  if (entry.timeout) {
+    clearTimeout(entry.timeout);
+  }
+  pendingAutoSubTrackChoices.delete(messageId);
+}
+function awaitAutoSubTrackChoice(messageId, defaultIndex = 0, tracks = []) {
+  clearAutoSubTrackChoice(messageId);
+  const safeDefault = Number.isInteger(defaultIndex) && defaultIndex >= 0 ? defaultIndex : 0;
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      clearAutoSubTrackChoice(messageId);
+      resolve(safeDefault);
+    }, 120000);
+    pendingAutoSubTrackChoices.set(messageId, { resolve, timeout, defaultIndex: safeDefault, tracks });
+  });
+}
+function resolveAutoSubTrackChoice(messageId, trackIndex) {
+  const entry = pendingAutoSubTrackChoices.get(messageId);
+  if (!entry) return false;
+  const resolvedIndex = Number.isInteger(trackIndex) && trackIndex >= 0 ? trackIndex : entry.defaultIndex;
+  if (entry.timeout) clearTimeout(entry.timeout);
+  pendingAutoSubTrackChoices.delete(messageId);
+  try {
+    entry.resolve(resolvedIndex);
+    return true;
+  } catch (err) {
+    console.warn('[Background] Failed to resolve pending track choice:', err);
+    return false;
+  }
+}
+function sendAutoSubTrackOptions(tabId, messageId, tracks, suggestedIndex = 0, extractedIndex = 0) {
+  if (!tabId) return;
+  const payload = {
+    type: 'AUTOSUB_TRACK_OPTIONS',
+    messageId,
+    tracks: Array.isArray(tracks) ? tracks : [],
+    suggestedIndex,
+    extractedIndex
+  };
+  chrome.tabs.sendMessage(tabId, payload).catch(err => {
+    console.error('[Background] Failed to send auto-sub track options:', err);
+  });
+}
+
+function buildHeadersFromPage(pageHeaders) {
+  const h = pageHeaders || {};
+  const headers = {};
+  if (h.referer) headers['Referer'] = h.referer;
+  if (h.cookie) headers['Cookie'] = h.cookie;
+  if (h.userAgent) headers['User-Agent'] = h.userAgent;
+  return Object.keys(headers).length ? headers : null;
+}
+
+async function probeAudioTracksFromStream(streamUrl, pageHeaders, ctx = null) {
+  try {
+    const sample = await fetchByteRangeSample(
+      streamUrl,
+      () => { },
+      { minBytes: 12 * 1024 * 1024, maxBytesCap: 64 * 1024 * 1024 },
+      buildHeadersFromPage(pageHeaders)
+    );
+    const headerInfo = parseMkvHeaderInfo(sample.buffer, { maxScanBytes: Math.min(sample.buffer.byteLength, 12 * 1024 * 1024) });
+    const audioTracks = (headerInfo?.tracks || [])
+      .filter(t => t.type === 0x02 || t.type === 2)
+      .map((t, idx) => ({
+        index: idx,
+        trackNumber: typeof t.number === 'number' ? t.number : idx + 1,
+        language: (t.language || '').trim(),
+        name: t.name || '',
+        codec: t.codecId || ''
+      }));
+    return audioTracks;
+  } catch (err) {
+    console.warn('[Background] Audio track probe failed:', err?.message || err);
+    if (ctx?.tabId) {
+      sendDebugLog(ctx.tabId, ctx.messageId, `Audio track probe failed: ${err?.message || err}`, 'warn');
+    }
+    return [];
+  }
+}
+
+function pickPreferredAudioTrack(tracks, langHint) {
+  if (!Array.isArray(tracks) || !tracks.length) return { preferred: null, ordered: [] };
+  const normalize = (l) => (l || '').split('-')[0].toLowerCase();
+  const hint = normalize(langHint || '');
+  const ordered = [...tracks];
+  const byHint = hint ? ordered.find(t => normalize(t.language) === hint) : null;
+  const byEn = ordered.find(t => normalize(t.language) === 'en');
+  const preferred = byHint || byEn || ordered[0];
+  return { preferred, ordered };
 }
 
 function sendDebugLog(tabId, messageId, text, level = 'info') {
