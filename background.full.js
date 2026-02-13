@@ -1010,41 +1010,147 @@ function arrayBufferToBase64(buffer) {
   return btoa(binary);
 }
 
-function normalizeCloudflareLanguageCode(input) {
+const STT_LANGUAGE_HINT_ALIASES = {
+  // English
+  en: 'en', eng: 'en', english: 'en', anglais: 'en', ingles: 'en', anglisch: 'en', enus: 'en', engb: 'en', enau: 'en',
+  // Spanish
+  es: 'es', spa: 'es', esp: 'es', spanish: 'es', espanol: 'es', castellano: 'es', castilian: 'es', es419: 'es', latam: 'es',
+  // Portuguese
+  pt: 'pt', por: 'pt', portuguese: 'pt', portugues: 'pt', pob: 'pt', ptbr: 'pt', ptpt: 'pt', brazilian: 'pt',
+  // French
+  fr: 'fr', fra: 'fr', fre: 'fr', french: 'fr', francais: 'fr',
+  // German
+  de: 'de', deu: 'de', ger: 'de', german: 'de', deutsch: 'de',
+  // Italian
+  it: 'it', ita: 'it', italian: 'it', italiano: 'it',
+  // Chinese
+  zh: 'zh', zho: 'zh', chi: 'zh', chinese: 'zh', cmn: 'zh', yue: 'zh', chs: 'zh', cht: 'zh', zhtw: 'zh', zhcn: 'zh', mandarin: 'zh', cantonese: 'zh',
+  // Japanese
+  ja: 'ja', jpn: 'ja', jap: 'ja', japanese: 'ja', nihongo: 'ja', jp: 'ja',
+  // Korean
+  ko: 'ko', kor: 'ko', korean: 'ko', kr: 'ko',
+  // High-frequency extras
+  ru: 'ru', rus: 'ru', russian: 'ru',
+  ar: 'ar', ara: 'ar', arabic: 'ar',
+  hi: 'hi', hin: 'hi', hindi: 'hi',
+  tr: 'tr', tur: 'tr', turkish: 'tr',
+  pl: 'pl', pol: 'pl', polish: 'pl',
+  nl: 'nl', nld: 'nl', dut: 'nl', dutch: 'nl', flemish: 'nl',
+  sv: 'sv', swe: 'sv', swedish: 'sv',
+  no: 'no', nor: 'no', norwegian: 'no', nob: 'no', nno: 'no',
+  da: 'da', dan: 'da', danish: 'da',
+  fi: 'fi', fin: 'fi', finnish: 'fi',
+  he: 'he', heb: 'he', hebrew: 'he', iw: 'he',
+  id: 'id', ind: 'id', indonesian: 'id', in: 'id',
+  vi: 'vi', vie: 'vi', vietnamese: 'vi',
+  th: 'th', tha: 'th', thai: 'th',
+  uk: 'uk', ukr: 'uk', ukrainian: 'uk',
+  ro: 'ro', ron: 'ro', rum: 'ro', romanian: 'ro',
+  cs: 'cs', ces: 'cs', cze: 'cs', czech: 'cs',
+  el: 'el', ell: 'el', gre: 'el', greek: 'el',
+  fa: 'fa', fas: 'fa', per: 'fa', pes: 'fa', farsi: 'fa', persian: 'fa',
+  ur: 'ur', urd: 'ur', urdu: 'ur',
+  bn: 'bn', ben: 'bn', bengali: 'bn',
+  ta: 'ta', tam: 'ta', tamil: 'ta',
+  te: 'te', tel: 'te', telugu: 'te',
+  ml: 'ml', mal: 'ml', malayalam: 'ml',
+  mr: 'mr', mar: 'mr', marathi: 'mr',
+  pa: 'pa', pan: 'pa', pun: 'pa', punjabi: 'pa',
+  gu: 'gu', guj: 'gu', gujarati: 'gu',
+  ne: 'ne', nep: 'ne', nepali: 'ne',
+  si: 'si', sin: 'si', sinhala: 'si', sinhalese: 'si',
+  my: 'my', mya: 'my', bur: 'my', burmese: 'my',
+  km: 'km', khm: 'km', khmer: 'km', cambodian: 'km',
+  lo: 'lo', lao: 'lo',
+  mn: 'mn', mon: 'mn', mongolian: 'mn',
+  ms: 'ms', msa: 'ms', may: 'ms', malay: 'ms',
+  tl: 'tl', tgl: 'tl', fil: 'tl', filipino: 'tl', tagalog: 'tl',
+  jv: 'jv', jav: 'jv', javanese: 'jv',
+  af: 'af', afr: 'af', afrikaans: 'af',
+  sq: 'sq', sqi: 'sq', alb: 'sq', albanian: 'sq',
+  am: 'am', amh: 'am', amharic: 'am',
+  az: 'az', aze: 'az', azerbaijani: 'az',
+  bg: 'bg', bul: 'bg', bulgarian: 'bg',
+  bs: 'bs', bos: 'bs', bosnian: 'bs',
+  ca: 'ca', cat: 'ca', catalan: 'ca',
+  cy: 'cy', cym: 'cy', wel: 'cy', welsh: 'cy',
+  eo: 'eo', epo: 'eo', esperanto: 'eo',
+  et: 'et', est: 'et', estonian: 'et',
+  eu: 'eu', eus: 'eu', baq: 'eu', basque: 'eu',
+  ga: 'ga', gle: 'ga', irish: 'ga',
+  gl: 'gl', glg: 'gl', galician: 'gl',
+  hr: 'hr', hrv: 'hr', cro: 'hr', croatian: 'hr',
+  hu: 'hu', hun: 'hu', hungarian: 'hu',
+  hy: 'hy', hye: 'hy', arm: 'hy', armenian: 'hy',
+  is: 'is', isl: 'is', ice: 'is', icelandic: 'is',
+  ka: 'ka', kat: 'ka', geo: 'ka', georgian: 'ka',
+  kk: 'kk', kaz: 'kk', kazakh: 'kk',
+  kn: 'kn', kan: 'kn', kannada: 'kn',
+  ky: 'ky', kir: 'ky', kyrgyz: 'ky',
+  lt: 'lt', lit: 'lt', lithuanian: 'lt',
+  lv: 'lv', lav: 'lv', latvian: 'lv',
+  mk: 'mk', mkd: 'mk', mac: 'mk', macedonian: 'mk',
+  ps: 'ps', pus: 'ps', pashto: 'ps',
+  sk: 'sk', slk: 'sk', slo: 'sk', slovak: 'sk',
+  sl: 'sl', slv: 'sl', slovenian: 'sl',
+  sr: 'sr', srp: 'sr', scc: 'sr', serbian: 'sr',
+  su: 'su', sun: 'su', sundanese: 'su',
+  sw: 'sw', swa: 'sw', swahili: 'sw',
+  tg: 'tg', tgk: 'tg', tajik: 'tg',
+  tk: 'tk', tuk: 'tk', turkmen: 'tk',
+  tt: 'tt', tat: 'tt', tatar: 'tt',
+  uz: 'uz', uzb: 'uz', uzbek: 'uz',
+  yi: 'yi', yid: 'yi', ji: 'yi', yiddish: 'yi',
+  yo: 'yo', yor: 'yo', yoruba: 'yo'
+};
+
+function normalizeLanguageHintToIso1(input) {
   if (!input) return '';
   const raw = String(input).trim().toLowerCase();
-  if (!raw || raw === 'auto' || raw === 'und' || raw === 'unknown') return '';
-  const base = raw.replace('_', '-');
-  const map = {
-    jpn: 'ja',
-    jap: 'ja',
-    japanese: 'ja',
-    eng: 'en',
-    english: 'en',
-    spa: 'es',
-    spanish: 'es',
-    por: 'pt',
-    portuguese: 'pt',
-    fra: 'fr',
-    fre: 'fr',
-    french: 'fr',
-    deu: 'de',
-    ger: 'de',
-    german: 'de',
-    ita: 'it',
-    italian: 'it',
-    zho: 'zh',
-    chi: 'zh',
-    chinese: 'zh',
-    kor: 'ko',
-    korean: 'ko',
-    rus: 'ru',
-    russian: 'ru'
-  };
-  if (map[base]) return map[base];
-  if (/^[a-z]{2}$/.test(base)) return base;
-  if (/^[a-z]{2}-[a-z]{2}$/.test(base)) return base;
+  if (!raw) return '';
+  const invalid = new Set([
+    'auto', 'und', 'unknown', 'undetermined', 'unk', 'null', 'none', 'n/a', 'na',
+    'mul', 'zxx', 'mis'
+  ]);
+  if (invalid.has(raw)) return '';
+
+  const ascii = raw.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const normalized = ascii
+    .replace(/[\[\]\(\)\{\}\.,;:|]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!normalized) return '';
+
+  const compact = normalized.replace(/[^a-z0-9]+/g, '');
+  if (STT_LANGUAGE_HINT_ALIASES[compact]) return STT_LANGUAGE_HINT_ALIASES[compact];
+
+  const bcp47ish = normalized.replace(/[^a-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^[-_]+|[-_]+$/g, '');
+  const parts = bcp47ish.split(/[-_]/).filter(Boolean);
+  if (parts.length) {
+    const first = parts[0];
+    if (STT_LANGUAGE_HINT_ALIASES[first]) return STT_LANGUAGE_HINT_ALIASES[first];
+    if (/^[a-z]{2}$/.test(first)) {
+      const legacy = { iw: 'he', ji: 'yi', in: 'id' };
+      return legacy[first] || first;
+    }
+  }
+
+  if (STT_LANGUAGE_HINT_ALIASES[normalized.replace(/\s+/g, '-')]) {
+    return STT_LANGUAGE_HINT_ALIASES[normalized.replace(/\s+/g, '-')];
+  }
+
+  const words = normalized.split(' ').filter(Boolean);
+  for (const w of words) {
+    const clean = w.replace(/[^a-z0-9]/g, '');
+    if (!clean) continue;
+    if (STT_LANGUAGE_HINT_ALIASES[clean]) return STT_LANGUAGE_HINT_ALIASES[clean];
+  }
+
   return '';
+}
+
+function normalizeCloudflareLanguageCode(input) {
+  return normalizeLanguageHintToIso1(input);
 }
 
 async function runCloudflareTranscription(audioBlob, opts = {}, ctx = null) {
@@ -2268,6 +2374,7 @@ async function handleAutoSubRequest(message, tabId) {
   const cfToken = data.cfToken || data.token;
   const model = data.model || '@cf/openai/whisper';
   let sourceLanguage = normalizeCloudflareLanguageCode(data.sourceLanguage || data.language) || '';
+  const hasExplicitSourceLanguage = !!sourceLanguage;
   const requestedTrackIndex = Number.isInteger(data.audioTrackIndex) ? data.audioTrackIndex : null;
   const diarization = data.diarization === true;
   const vadFilter = data.vadFilter === true; // VAD filter for turbo model
@@ -2349,6 +2456,10 @@ async function handleAutoSubRequest(message, tabId) {
         initialTrackIndex = 0;
       }
     }
+    if (!hasExplicitSourceLanguage) {
+      const selectedTrackLang = resolveTrackLanguageByIndex(audioTracks, initialTrackIndex, normalizeCloudflareLanguageCode);
+      if (selectedTrackLang) sourceLanguage = selectedTrackLang;
+    }
 
     const streamAttempts = (() => {
       if (userSelectedTrack && Number.isInteger(initialTrackIndex)) {
@@ -2364,6 +2475,9 @@ async function handleAutoSubRequest(message, tabId) {
     for (let i = 0; i < streamAttempts.length; i++) {
       let audioStreamIndex = streamAttempts[i];
       try {
+        const attemptSourceLanguage = hasExplicitSourceLanguage
+          ? sourceLanguage
+          : (resolveTrackLanguageByIndex(audioTracks, audioStreamIndex, normalizeCloudflareLanguageCode) || sourceLanguage || '');
         const extractForTrack = async (idx, statusOverride = '') => {
           const status = statusOverride || `Preparing pipeline (audio track ${idx + 1})...`;
           sendAutoSubProgress(tabId, messageId, 5, status, 'init');
@@ -2378,14 +2492,14 @@ async function handleAutoSubRequest(message, tabId) {
             { audioStreamIndex: idx }
           );
           sendAutoSubProgress(tabId, messageId, 65, `Audio ready (track ${idx + 1}).`, 'fetch');
-          sendDebugLog(tabId, messageId, `Audio ready; forwarding ${audioWindows.length} window(s) to Cloudflare (audio track ${idx + 1}, lang=${sourceLanguage || 'auto'})`, 'info');
+          sendDebugLog(tabId, messageId, `Audio ready; forwarding ${audioWindows.length} window(s) to Cloudflare (audio track ${idx + 1}, lang=${attemptSourceLanguage || 'auto'})`, 'info');
           return audioWindows;
         };
 
         const audioWindows = await extractForTrack(audioStreamIndex);
         const transcript = await transcribeWindowsWithCloudflare(
           audioWindows,
-          { accountId: cfAccountId, token: cfToken, model, sourceLanguage, diarization, vadFilter, filename: data.filename || 'audio' },
+          { accountId: cfAccountId, token: cfToken, model, sourceLanguage: attemptSourceLanguage, diarization, vadFilter, filename: data.filename || 'audio' },
           (p, status) => sendAutoSubProgress(tabId, messageId, Math.min(92, Math.round(p)), status || 'Transcribing...', 'transcribe'),
           ctx
         );
@@ -2461,6 +2575,8 @@ function normalizeToAssemblyAILanguage(lang) {
   if (!lang) return null;
   const input = String(lang).toLowerCase().trim();
   if (!input) return null;
+  const normalizedTag = input.replace(/\s+/g, '-').replace(/_/g, '-');
+  const iso1 = normalizeLanguageHintToIso1(input);
 
   // AssemblyAI supported language codes (direct matches)
   const assemblyAI_SUPPORTED = new Set([
@@ -2582,16 +2698,39 @@ function normalizeToAssemblyAILanguage(lang) {
   if (assemblyAI_SUPPORTED.has(input)) {
     return input;
   }
+  if (assemblyAI_SUPPORTED.has(input.replace(/-/g, '_'))) {
+    return input.replace(/-/g, '_');
+  }
+
+  // Preserve English regional variants when explicitly provided.
+  const regionMatch = normalizedTag.match(/^([a-z]{2,3})(?:-[a-z]{4})?(?:-([a-z]{2}))$/i);
+  if (regionMatch) {
+    const base = normalizeLanguageHintToIso1(regionMatch[1]);
+    const region = (regionMatch[2] || '').toLowerCase();
+    if (base === 'en') {
+      if (region === 'au') return 'en_au';
+      if (region === 'gb' || region === 'uk') return 'en_uk';
+      if (region === 'us') return 'en_us';
+      return 'en';
+    }
+  }
 
   // Check if it's an ISO 639-2 code or language name that needs mapping
   if (ISO_639_2_TO_ASSEMBLY.hasOwnProperty(input)) {
     return ISO_639_2_TO_ASSEMBLY[input];
   }
+  if (ISO_639_2_TO_ASSEMBLY.hasOwnProperty(normalizedTag)) {
+    return ISO_639_2_TO_ASSEMBLY[normalizedTag];
+  }
+  if (iso1) {
+    if (iso1 === 'jv') return 'jw'; // AssemblyAI expects 'jw'
+    if (assemblyAI_SUPPORTED.has(iso1)) return iso1;
+  }
 
   // Handle regional variants (e.g., 'en-US' -> 'en_us', 'pt-BR' -> 'pt')
-  const dashMatch = input.match(/^([a-z]{2,3})[-_]([a-z]{2})$/i);
+  const dashMatch = normalizedTag.match(/^([a-z]{2,3})(?:-[a-z]{4})?[-_]([a-z]{2})$/i);
   if (dashMatch) {
-    const base = dashMatch[1].toLowerCase();
+    const base = normalizeLanguageHintToIso1(dashMatch[1]) || dashMatch[1].toLowerCase();
     const region = dashMatch[2].toLowerCase();
     // Check for specific English variants
     if (base === 'en') {
@@ -2773,7 +2912,8 @@ async function handleAssemblyAutoSubRequest(message, tabId) {
   const { messageId, data = {} } = message || {};
   const streamUrl = data.streamUrl;
   const apiKey = (data.assemblyApiKey || '').trim();
-  let sourceLanguage = (data.sourceLanguage || data.language || '').trim();
+  let sourceLanguage = normalizeToAssemblyAILanguage(data.sourceLanguage || data.language) || '';
+  const hasExplicitSourceLanguage = !!sourceLanguage;
   const requestedTrackIndex = Number.isInteger(data.audioTrackIndex) ? data.audioTrackIndex : null;
   const diarization = data.diarization === true;
   const sendFullVideo = data.sendFullVideo === true;
@@ -2795,7 +2935,7 @@ async function handleAssemblyAutoSubRequest(message, tabId) {
     }
     const { preferred, ordered } = pickPreferredAudioTrack(audioTracks, sourceLanguage || 'en');
     if (!sourceLanguage && preferred?.language) {
-      sourceLanguage = preferred.language;
+      sourceLanguage = normalizeToAssemblyAILanguage(preferred.language) || '';
     }
 
     let audioTrackIndex = Number.isInteger(requestedTrackIndex) ? requestedTrackIndex : null;
@@ -2819,6 +2959,10 @@ async function handleAssemblyAutoSubRequest(message, tabId) {
       } else {
         audioTrackIndex = 0;
       }
+    }
+    if (!hasExplicitSourceLanguage) {
+      const selectedTrackLang = resolveTrackLanguageByIndex(audioTracks, audioTrackIndex, normalizeToAssemblyAILanguage);
+      if (selectedTrackLang) sourceLanguage = selectedTrackLang;
     }
 
     progress(5, 'Preparing AssemblyAI pipeline...', 'fetch');
@@ -5065,7 +5209,8 @@ async function probeAudioTracksFromStream(streamUrl, pageHeaders, ctx = null) {
       .map((t, idx) => ({
         index: idx,
         trackNumber: typeof t.number === 'number' ? t.number : idx + 1,
-        language: (t.language || '').trim(),
+        // Matroska default track language is English when language elements are omitted.
+        language: (t.languageIetf || t.language || 'eng').trim(),
         name: t.name || '',
         codec: t.codecId || ''
       }));
@@ -5081,13 +5226,31 @@ async function probeAudioTracksFromStream(streamUrl, pageHeaders, ctx = null) {
 
 function pickPreferredAudioTrack(tracks, langHint) {
   if (!Array.isArray(tracks) || !tracks.length) return { preferred: null, ordered: [] };
-  const normalize = (l) => (l || '').split('-')[0].toLowerCase();
+  const normalize = (l) => {
+    const iso = normalizeLanguageHintToIso1(l);
+    if (iso) return iso;
+    const cf = normalizeCloudflareLanguageCode(l);
+    if (cf) return cf;
+    const raw = String(l || '').trim().toLowerCase();
+    if (!raw) return '';
+    return raw.split(/[-_]/)[0];
+  };
   const hint = normalize(langHint || '');
   const ordered = [...tracks];
   const byHint = hint ? ordered.find(t => normalize(t.language) === hint) : null;
   const byEn = ordered.find(t => normalize(t.language) === 'en');
   const preferred = byHint || byEn || ordered[0];
   return { preferred, ordered };
+}
+
+function resolveTrackLanguageByIndex(tracks, streamIndex, normalizer) {
+  if (!Array.isArray(tracks) || !tracks.length || !Number.isInteger(streamIndex)) return '';
+  const match = tracks.find((t) => Number.isInteger(t?.index) && t.index === streamIndex) || null;
+  if (!match) return '';
+  const language = (match.language || '').toString().trim();
+  if (!language) return '';
+  const normalized = typeof normalizer === 'function' ? normalizer(language) : language;
+  return (normalized || '').toString().trim();
 }
 
 function sendDebugLog(tabId, messageId, text, level = 'info') {
@@ -7030,7 +7193,7 @@ const TRACK_LANG_NORMALIZE_MAP = {
   ger: 'de', deu: 'de', gerde: 'de',
   ita: 'it', itb: 'it',
   rus: 'ru', rusru: 'ru',
-  chi: 'zh', zho: 'zh', cmn: 'zh', mlt: 'zh', mnd: 'zh', chs: 'zh', cht: 'zh', zhn: 'zh', zhcn: 'zh', zhtw: 'zh', zh_hans: 'zh', zh_hant: 'zh',
+  chi: 'zh', zho: 'zh', cmn: 'zh', yue: 'zh', mnd: 'zh', chs: 'zh', cht: 'zh', zhn: 'zh', zhcn: 'zh', zhtw: 'zh', zh_hans: 'zh', zh_hant: 'zh',
   jpn: 'ja', jap: 'ja', jp: 'ja',
   kor: 'ko', korus: 'ko', kr: 'ko',
   ara: 'ar', arg: 'ar', arb: 'ar', arq: 'ar',
@@ -7103,7 +7266,8 @@ const TRACK_LANG_NORMALIZE_MAP = {
   amh: 'am',
   epo: 'eo',
   fil: 'tl', tgl: 'tl',
-  msa: 'ms', may: 'ms'
+  msa: 'ms', may: 'ms',
+  mlt: 'mt'
 };
 
 const LANGUAGE_NAME_ALIASES = {
