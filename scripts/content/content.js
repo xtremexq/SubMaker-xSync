@@ -18,14 +18,14 @@ function translate(key, fallback) {
     if (typeof window !== 'undefined' && typeof window.t === 'function') {
       return window.t(key, {}, fallback || key);
     }
-  } catch (_) {}
+  } catch (_) { }
   try {
     if (typeof chrome !== 'undefined' && chrome.i18n?.getMessage) {
       const chromeKey = String(key || '').replace(/[^a-zA-Z0-9_]/g, '_');
       const msg = chrome.i18n.getMessage(chromeKey);
       if (msg) return msg;
     }
-  } catch (_) {}
+  } catch (_) { }
   return fallback || key;
 }
 
@@ -135,14 +135,14 @@ function readInstallUrl() {
     if (typeof window !== 'undefined' && typeof window.installUrl === 'string' && window.installUrl) {
       return window.installUrl;
     }
-  } catch (_) {}
+  } catch (_) { }
   for (const id of INSTALL_URL_INPUT_IDS) {
     try {
       const el = document.getElementById(id);
       if (!el) continue;
       const candidate = (el.value || el.textContent || '').trim();
       if (candidate) return candidate;
-    } catch (_) {}
+    } catch (_) { }
   }
   return null;
 }
@@ -656,7 +656,7 @@ async function handleAutoSubRequest(message) {
     hasStreamUrl: !!message.data?.streamUrl
   });
 
-  const { streamUrl, filename, model, sourceLanguage, diarization, useAssembly, assemblyApiKey, sendFullVideo, cfWindowSizeMb } = message.data || {};
+  const { streamUrl, filename, model, sourceLanguage, diarization, useAssembly, assemblyApiKey, sendFullVideo, cfWindowSizeMb, vadFilter } = message.data || {};
   const pageHeaders = {
     referer: window.location.href || null,
     cookie: document?.cookie || null,
@@ -687,6 +687,7 @@ async function handleAutoSubRequest(message) {
         assemblyApiKey: assemblyApiKey || '',
         sendFullVideo: sendFullVideo === true,
         cfWindowSizeMb: cfWindowSizeMb,
+        vadFilter: vadFilter === true,
         pageHeaders
       }
     }, 'auto-subtitles');

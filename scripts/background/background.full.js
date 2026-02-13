@@ -17,6 +17,30 @@ self.addEventListener('unhandledrejection', (evt) => {
   } catch (_) { }
 });
 
+// MV3 service workers may lack URL.createObjectURL; shim to data: URLs for worker loaders.
+(function ensureObjectUrlSupport() {
+  if (typeof URL === 'undefined') return;
+  if (typeof URL.createObjectURL === 'function') return;
+  if (typeof Blob === 'undefined') return;
+  if (typeof FileReaderSync === 'undefined') {
+    console.warn('[Background] URL.createObjectURL unavailable and FileReaderSync missing; some loaders may fail.');
+    return;
+  }
+  URL.createObjectURL = (blob) => {
+    try {
+      const reader = new FileReaderSync();
+      return reader.readAsDataURL(blob);
+    } catch (err) {
+      console.warn('[Background] URL.createObjectURL shim failed:', err?.message || err);
+      throw err;
+    }
+  };
+  if (typeof URL.revokeObjectURL !== 'function') {
+    URL.revokeObjectURL = () => { };
+  }
+  console.warn('[Background] URL.createObjectURL shimmed via FileReaderSync (data URLs).');
+})();
+
 const _workerBootTs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 console.log('[Background][Timing] worker boot at', _workerBootTs);
 // Heavy libraries (FFmpeg/IDB helpers) now load lazily to keep popup open quickly.
@@ -3019,11 +3043,11 @@ function probeMp4Duration(buffer) {
 }
 
 const SYNC_PLAN_DEFAULTS = {
-  quick:   { coveragePct: 0.05, minWindows: 3, maxWindows: 5, windowSeconds: 45, legacyMode: 'quick' },
-  smart:   { coveragePct: 0.1,  minWindows: 4, maxWindows: 7, windowSeconds: 60, legacyMode: 'fast' },
-  long:    { coveragePct: 0.18, minWindows: 6, maxWindows: 10, windowSeconds: 75, legacyMode: 'complete' },
-  thorough:{ coveragePct: 0.32, minWindows: 8, maxWindows: 14, windowSeconds: 90, legacyMode: 'complete' },
-  complete:{ coveragePct: 1,    minWindows: null, maxWindows: null, windowSeconds: null, legacyMode: 'complete', fullScan: true }
+  quick: { coveragePct: 0.05, minWindows: 3, maxWindows: 5, windowSeconds: 45, legacyMode: 'quick' },
+  smart: { coveragePct: 0.1, minWindows: 4, maxWindows: 7, windowSeconds: 60, legacyMode: 'fast' },
+  long: { coveragePct: 0.18, minWindows: 6, maxWindows: 10, windowSeconds: 75, legacyMode: 'complete' },
+  thorough: { coveragePct: 0.32, minWindows: 8, maxWindows: 14, windowSeconds: 90, legacyMode: 'complete' },
+  complete: { coveragePct: 1, minWindows: null, maxWindows: null, windowSeconds: null, legacyMode: 'complete', fullScan: true }
 };
 const PLAN_MIN_WINDOW_SECONDS = 20;
 const PLAN_MAX_WINDOW_SECONDS = 7200;
@@ -4120,7 +4144,37 @@ async function tryTargetedMkvStrategies(ctx) {
   return null;
 }
 
+async function readResponseCapped(response, maxBytes) {
+  const cl = parseInt(response.headers?.get?.('content-length') || '0', 10) || 0;
+  if (cl > maxBytes) {
+    throw new Error(`Response too large (${Math.round(cl / (1024 * 1024))} MB exceeds ${Math.round(maxBytes / (1024 * 1024))} MB cap)`);
+  }
+  const reader = response.body && typeof response.body.getReader === 'function' ? response.body.getReader() : null;
+  if (!reader) {
+    return await response.arrayBuffer();
+  }
+  const chunks = [];
+  let received = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value && value.length) {
+      received += value.length;
+      if (received > maxBytes) {
+        try { reader.cancel(); } catch (_) { }
+        throw new Error(`Download exceeded ${Math.round(maxBytes / (1024 * 1024))} MB memory cap`);
+      }
+      chunks.push(value);
+    }
+  }
+  if (chunks.length === 0) return new ArrayBuffer(0);
+  if (chunks.length === 1) return chunks[0].buffer || chunks[0];
+  const combined = concatBuffersList(chunks);
+  return combined.buffer;
+}
+
 async function fetchFullStreamBuffer(url, onProgress, baseHeaders = null) {
+  const MAX_SAFE_BYTES = 1.8 * 1024 * 1024 * 1024;
   const fetchOpts = baseHeaders ? { headers: baseHeaders } : undefined;
   const res = await safeFetch(url, fetchOpts);
   if (!res.ok) {
@@ -4130,40 +4184,44 @@ async function fetchFullStreamBuffer(url, onProgress, baseHeaders = null) {
   const totalBytes = parseInt(res.headers.get('content-length') || '0', 10) || null;
   const reader = res.body && typeof res.body.getReader === 'function' ? res.body.getReader() : null;
   if (!reader) {
+    if (totalBytes && totalBytes > MAX_SAFE_BYTES) {
+      throw new Error(`Stream too large for memory (${Math.round(totalBytes / (1024 * 1024))} MB)`);
+    }
     const buf = await res.arrayBuffer();
     onProgress?.(100);
-    return { buffer: buf, totalBytes: totalBytes || (buf?.byteLength || null), contentType };
+    return { buffer: new Uint8Array(buf), totalBytes: totalBytes || (buf?.byteLength || null), contentType, partial: false };
   }
 
   let received = 0;
   const chunks = [];
-  let allocated = null;
-
-  if (totalBytes && totalBytes > 0) {
-    allocated = new Uint8Array(totalBytes);
-  }
+  let truncated = false;
+  const reportTotal = totalBytes ? Math.min(totalBytes, MAX_SAFE_BYTES) : 0;
 
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     if (value && value.length) {
-      if (allocated) {
-        allocated.set(value, received);
-      } else {
-        chunks.push(value);
+      if (received + value.length > MAX_SAFE_BYTES) {
+        const remaining = Math.max(0, MAX_SAFE_BYTES - received);
+        if (remaining > 0) chunks.push(value.slice(0, remaining));
+        received += remaining;
+        truncated = true;
+        try { reader.cancel(); } catch (_) { }
+        console.warn(`[Background] Stream capped at ${Math.round(received / (1024 * 1024))} MB`);
+        break;
       }
+      chunks.push(value);
       received += value.length;
-      const pct = totalBytes ? Math.round((received / totalBytes) * 95) : Math.min(95, Math.round(received / (1024 * 1024)));
+      const pct = reportTotal > 0
+        ? Math.round((received / reportTotal) * 95)
+        : Math.min(95, Math.round(received / (1024 * 1024)));
       onProgress?.(Math.min(95, pct));
     }
   }
 
-  const buffer = allocated
-    ? (totalBytes && received < totalBytes ? allocated.subarray(0, received) : allocated)
-    : concatBuffersList(chunks);
-
+  const buffer = concatBuffersList(chunks);
   onProgress?.(100);
-  return { buffer, totalBytes: totalBytes || received, contentType };
+  return { buffer, totalBytes: totalBytes || received, contentType, partial: truncated };
 }
 
 async function fetchFullHlsStream(m3u8Url, onProgress, baseHeaders = null) {
@@ -4193,6 +4251,10 @@ async function fetchFullHlsStream(m3u8Url, onProgress, baseHeaders = null) {
     const buf = new Uint8Array(await res.arrayBuffer());
     buffers.push(buf);
     totalBytes += buf.byteLength || 0;
+    if (totalBytes > 1.8 * 1024 * 1024 * 1024) {
+      console.warn(`[Background][HLS] Stream capped at ${Math.round(totalBytes / (1024 * 1024))} MB`);
+      break;
+    }
     const pct = Math.min(95, Math.round(((i + 1) / totalSegments) * 95));
     onProgress?.(pct);
   }
@@ -4237,18 +4299,18 @@ async function fetchByteRangeSample(url, onProgress, options = {}, baseHeaders =
 
   const contentLength = parseInt(res.headers.get('content-length') || '0', 10) || null;
   const rangeTotal = parseContentRangeTotal(res.headers.get('content-range'));
+  const MAX_SAMPLE_SAFE = 1.8 * 1024 * 1024 * 1024;
   let buf;
   try {
-    buf = await res.arrayBuffer();
+    buf = await readResponseCapped(res, MAX_SAMPLE_SAFE);
   } catch (err) {
-    // Some hosts will serve the stream but block ranged body reads; retry without Range.
     if (usedRange) {
       console.warn('[Background] Reading ranged response failed, retrying full fetch without Range:', err?.message || err);
       usedRange = false;
       isPartial = false;
       res = await safeFetch(url);
       if (!res.ok) throw new Error(`Failed to fetch stream (HTTP ${res.status})`);
-      buf = await res.arrayBuffer();
+      buf = await readResponseCapped(res, MAX_SAMPLE_SAFE);
     } else {
       throw err;
     }
@@ -4260,7 +4322,7 @@ async function fetchByteRangeSample(url, onProgress, options = {}, baseHeaders =
       isPartial = false;
       res = await safeFetch(url);
       if (!res.ok) throw new Error(`Failed to fetch stream (HTTP ${res.status})`);
-      buf = await res.arrayBuffer();
+      buf = await readResponseCapped(res, MAX_SAMPLE_SAFE);
     }
     if (!buf || buf.byteLength === 0) {
       throw new Error('Stream fetch returned an empty buffer; host may have blocked the request.');
@@ -4670,85 +4732,85 @@ const TRACK_LANG_NORMALIZE_MAP = {
   eng: 'en', enu: 'en', enus: 'en', enn: 'en', enuk: 'en', en_gb: 'en', en_gb: 'en', enus: 'en', engb: 'en', enau: 'en', enze: 'en',
   spa: 'es', esl: 'es', esu: 'es', esp: 'es', espanol: 'es', spn: 'es', es419: 'es', lat: 'es', latam: 'es', castellano: 'es',
   por: 'por', pt: 'por', porpt: 'por', pt_pt: 'por',
-  pob: 'pob', pb: 'pob', ptb: 'pob', ptbr: 'pob', pt-br: 'pob', porbr: 'pob', brazpor: 'pob', brazilian: 'pob',
-  fre: 'fr', fra: 'fr', frf: 'fr', frca: 'fr', frfr: 'fr',
-  ger: 'de', deu: 'de', gerde: 'de',
-  ita: 'it', itb: 'it',
-  rus: 'ru', rusru: 'ru',
-  chi: 'zh', zho: 'zh', cmn: 'zh', mlt: 'zh', mnd: 'zh', chs: 'zh', cht: 'zh', zhn: 'zh', zhcn: 'zh', zhtw: 'zh', zh_hans: 'zh', zh_hant: 'zh',
-  jpn: 'ja', jap: 'ja', jp: 'ja',
-  kor: 'ko', korus: 'ko', kr: 'ko',
-  ara: 'ar', arg: 'ar', arb: 'ar', arq: 'ar',
-  hin: 'hi', hnd: 'hi',
-  tur: 'tr', turk: 'tr',
-  pol: 'pl',
-  dut: 'nl', nld: 'nl', hol: 'nl', fla: 'nl', vla: 'nl',
-  swe: 'sv', sve: 'sv',
-  nor: 'no', nob: 'no', nno: 'no', norw: 'no', bok: 'no', nyn: 'no',
-  dan: 'da',
-  fin: 'fi',
-  hun: 'hu', hunh: 'hu',
-  ces: 'cs', cze: 'cs',
-  ell: 'el', gre: 'el', grk: 'el',
-  heb: 'he', arahe: 'he', hebrew: 'he', iw: 'he',
-  vie: 'vi', vit: 'vi',
-  ind: 'id', ina: 'id', bah: 'id',
-  tha: 'th',
-  ukr: 'uk', ukraines: 'uk',
-  ron: 'ro', rum: 'ro', rom: 'ro', rop: 'ro',
-  bul: 'bg',
-  slk: 'sk', slo: 'sk',
-  slv: 'sl',
-  hrv: 'hr', cro: 'hr',
-  srp: 'sr', scc: 'sr',
-  bos: 'bs',
-  cat: 'ca',
-  fas: 'fa', per: 'fa', pes: 'fa', farsi: 'fa',
-  urd: 'ur',
-  ben: 'bn', bang: 'bn',
-  tam: 'ta',
-  tel: 'te',
-  mar: 'mr',
-  kan: 'kn',
-  mal: 'ml',
-  pan: 'pa', pun: 'pa',
-  guj: 'gu',
-  nep: 'ne',
-  sin: 'si',
-  mya: 'my', bur: 'my',
-  khm: 'km',
-  lao: 'lo', laoian: 'lo',
-  mon: 'mn',
-  uzb: 'uz',
-  kaz: 'kk',
-  kir: 'ky',
-  tgk: 'tg',
-  tuk: 'tk',
-  pus: 'ps', pst: 'ps',
-  som: 'so',
-  amh: 'am',
-  hau: 'ha',
-  yor: 'yo',
-  zul: 'zu',
-  xho: 'xh',
-  afr: 'af',
-  eus: 'eu', baq: 'eu',
-  glg: 'gl',
-  glv: 'gv',
-  gle: 'ga',
-  cym: 'cy', wel: 'cy',
-  isl: 'is',
-  sqi: 'sq', alb: 'sq',
-  mkd: 'mk', mac: 'mk',
-  est: 'et',
-  lit: 'lt',
-  lav: 'lv',
-  aze: 'az',
-  kat: 'ka', geo: 'ka',
-  amh: 'am',
-  epo: 'eo',
-  fil: 'tl', tgl: 'tl',
-  msa: 'ms', may: 'ms'
+  pob: 'pob', pb: 'pob', ptb: 'pob', ptbr: 'pob', pt- br: 'pob', porbr: 'pob', brazpor: 'pob', brazilian: 'pob',
+    fre: 'fr', fra: 'fr', frf: 'fr', frca: 'fr', frfr: 'fr',
+      ger: 'de', deu: 'de', gerde: 'de',
+        ita: 'it', itb: 'it',
+          rus: 'ru', rusru: 'ru',
+            chi: 'zh', zho: 'zh', cmn: 'zh', mlt: 'zh', mnd: 'zh', chs: 'zh', cht: 'zh', zhn: 'zh', zhcn: 'zh', zhtw: 'zh', zh_hans: 'zh', zh_hant: 'zh',
+              jpn: 'ja', jap: 'ja', jp: 'ja',
+                kor: 'ko', korus: 'ko', kr: 'ko',
+                  ara: 'ar', arg: 'ar', arb: 'ar', arq: 'ar',
+                    hin: 'hi', hnd: 'hi',
+                      tur: 'tr', turk: 'tr',
+                        pol: 'pl',
+                          dut: 'nl', nld: 'nl', hol: 'nl', fla: 'nl', vla: 'nl',
+                            swe: 'sv', sve: 'sv',
+                              nor: 'no', nob: 'no', nno: 'no', norw: 'no', bok: 'no', nyn: 'no',
+                                dan: 'da',
+                                  fin: 'fi',
+                                    hun: 'hu', hunh: 'hu',
+                                      ces: 'cs', cze: 'cs',
+                                        ell: 'el', gre: 'el', grk: 'el',
+                                          heb: 'he', arahe: 'he', hebrew: 'he', iw: 'he',
+                                            vie: 'vi', vit: 'vi',
+                                              ind: 'id', ina: 'id', bah: 'id',
+                                                tha: 'th',
+                                                  ukr: 'uk', ukraines: 'uk',
+                                                    ron: 'ro', rum: 'ro', rom: 'ro', rop: 'ro',
+                                                      bul: 'bg',
+                                                        slk: 'sk', slo: 'sk',
+                                                          slv: 'sl',
+                                                            hrv: 'hr', cro: 'hr',
+                                                              srp: 'sr', scc: 'sr',
+                                                                bos: 'bs',
+                                                                  cat: 'ca',
+                                                                    fas: 'fa', per: 'fa', pes: 'fa', farsi: 'fa',
+                                                                      urd: 'ur',
+                                                                        ben: 'bn', bang: 'bn',
+                                                                          tam: 'ta',
+                                                                            tel: 'te',
+                                                                              mar: 'mr',
+                                                                                kan: 'kn',
+                                                                                  mal: 'ml',
+                                                                                    pan: 'pa', pun: 'pa',
+                                                                                      guj: 'gu',
+                                                                                        nep: 'ne',
+                                                                                          sin: 'si',
+                                                                                            mya: 'my', bur: 'my',
+                                                                                              khm: 'km',
+                                                                                                lao: 'lo', laoian: 'lo',
+                                                                                                  mon: 'mn',
+                                                                                                    uzb: 'uz',
+                                                                                                      kaz: 'kk',
+                                                                                                        kir: 'ky',
+                                                                                                          tgk: 'tg',
+                                                                                                            tuk: 'tk',
+                                                                                                              pus: 'ps', pst: 'ps',
+                                                                                                                som: 'so',
+                                                                                                                  amh: 'am',
+                                                                                                                    hau: 'ha',
+                                                                                                                      yor: 'yo',
+                                                                                                                        zul: 'zu',
+                                                                                                                          xho: 'xh',
+                                                                                                                            afr: 'af',
+                                                                                                                              eus: 'eu', baq: 'eu',
+                                                                                                                                glg: 'gl',
+                                                                                                                                  glv: 'gv',
+                                                                                                                                    gle: 'ga',
+                                                                                                                                      cym: 'cy', wel: 'cy',
+                                                                                                                                        isl: 'is',
+                                                                                                                                          sqi: 'sq', alb: 'sq',
+                                                                                                                                            mkd: 'mk', mac: 'mk',
+                                                                                                                                              est: 'et',
+                                                                                                                                                lit: 'lt',
+                                                                                                                                                  lav: 'lv',
+                                                                                                                                                    aze: 'az',
+                                                                                                                                                      kat: 'ka', geo: 'ka',
+                                                                                                                                                        amh: 'am',
+                                                                                                                                                          epo: 'eo',
+                                                                                                                                                            fil: 'tl', tgl: 'tl',
+                                                                                                                                                              msa: 'ms', may: 'ms'
 };
 
 const LANGUAGE_NAME_ALIASES = {

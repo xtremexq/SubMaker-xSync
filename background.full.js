@@ -18,6 +18,30 @@ self.addEventListener('unhandledrejection', (evt) => {
   } catch (_) { }
 });
 
+// MV3 service workers may lack URL.createObjectURL; shim to data: URLs for worker loaders.
+(function ensureObjectUrlSupport() {
+  if (typeof URL === 'undefined') return;
+  if (typeof URL.createObjectURL === 'function') return;
+  if (typeof Blob === 'undefined') return;
+  if (typeof FileReaderSync === 'undefined') {
+    console.warn('[Background] URL.createObjectURL unavailable and FileReaderSync missing; some loaders may fail.');
+    return;
+  }
+  URL.createObjectURL = (blob) => {
+    try {
+      const reader = new FileReaderSync();
+      return reader.readAsDataURL(blob);
+    } catch (err) {
+      console.warn('[Background] URL.createObjectURL shim failed:', err?.message || err);
+      throw err;
+    }
+  };
+  if (typeof URL.revokeObjectURL !== 'function') {
+    URL.revokeObjectURL = () => { };
+  }
+  console.warn('[Background] URL.createObjectURL shimmed via FileReaderSync (data URLs).');
+})();
+
 const _workerBootTs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 console.log('[Background][Timing] worker boot at', _workerBootTs);
 // Heavy libraries (FFmpeg/IDB helpers) now load lazily to keep popup open quickly.
@@ -366,34 +390,25 @@ async function loadWorkerScript(url) {
   importScripts(url);
 }
 
-// Defensive helper: try importScripts first, then fall back to fetch + Blob if parsing fails
+// Defensive helper: try importScripts only (CSP-safe).
+// Note: URL.createObjectURL is NOT available in MV3 service workers (no DOM APIs)
 async function importScriptSafe(url, label = '') {
   if (!url) throw new Error('Missing script URL');
   const display = label || url;
+  let importErr = null;
+
+  // Primary method: importScripts (works for chrome-extension:// URLs)
   try {
     importScripts(url);
     return true;
   } catch (err) {
+    importErr = err;
     console.warn(`[Background] importScripts failed for ${display}:`, err?.message || err);
   }
-  try {
-    const res = await fetch(url, { cache: 'no-store' });
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-    const code = await res.text();
-    const blobUrl = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
-    try {
-      importScripts(blobUrl);
-      console.log(`[Background] Loaded ${display} via fetch fallback`);
-      return true;
-    } finally {
-      URL.revokeObjectURL(blobUrl);
-    }
-  } catch (err2) {
-    console.error(`[Background] Fallback import failed for ${display}:`, err2?.message || err2);
-    const enriched = new Error(`Failed to load ${display}: ${err2?.message || err2}`);
-    enriched.cause = err2;
-    throw enriched;
-  }
+
+  const enriched = new Error(`Failed to load ${display}: ${importErr?.message || importErr || 'importScripts failed'}`);
+  enriched.cause = importErr;
+  throw enriched;
 }
 
 /**
@@ -980,6 +995,58 @@ function segmentsToSrt(segments = []) {
   return lines.join('\n');
 }
 
+/**
+ * Convert ArrayBuffer to Base64 string
+ * Required for Cloudflare whisper-large-v3-turbo which expects Base64 audio
+ */
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode.apply(null, chunk);
+  }
+  return btoa(binary);
+}
+
+function normalizeCloudflareLanguageCode(input) {
+  if (!input) return '';
+  const raw = String(input).trim().toLowerCase();
+  if (!raw || raw === 'auto' || raw === 'und' || raw === 'unknown') return '';
+  const base = raw.replace('_', '-');
+  const map = {
+    jpn: 'ja',
+    jap: 'ja',
+    japanese: 'ja',
+    eng: 'en',
+    english: 'en',
+    spa: 'es',
+    spanish: 'es',
+    por: 'pt',
+    portuguese: 'pt',
+    fra: 'fr',
+    fre: 'fr',
+    french: 'fr',
+    deu: 'de',
+    ger: 'de',
+    german: 'de',
+    ita: 'it',
+    italian: 'it',
+    zho: 'zh',
+    chi: 'zh',
+    chinese: 'zh',
+    kor: 'ko',
+    korean: 'ko',
+    rus: 'ru',
+    russian: 'ru'
+  };
+  if (map[base]) return map[base];
+  if (/^[a-z]{2}$/.test(base)) return base;
+  if (/^[a-z]{2}-[a-z]{2}$/.test(base)) return base;
+  return '';
+}
+
 async function runCloudflareTranscription(audioBlob, opts = {}, ctx = null) {
   const accountId = (opts.accountId || '').trim();
   const token = (opts.token || '').trim();
@@ -996,7 +1063,14 @@ async function runCloudflareTranscription(audioBlob, opts = {}, ctx = null) {
   let response;
   let raw = '';
   let attemptedJson = false;
-  const mustUseJson = opts.forceJson === true || !!opts.sourceLanguage || opts.diarization === true;
+  const normalizedSourceLanguage = normalizeCloudflareLanguageCode(opts.sourceLanguage);
+  // Determine if this is the turbo model (different API schema)
+  const isTurboModel = model.includes('whisper-large-v3-turbo');
+  // For base @cf/openai/whisper: only raw binary or array of integers is accepted (no language param)
+  // For @cf/openai/whisper-large-v3-turbo: accepts Base64 audio + task + optional language/prompt fields
+  // NOTE: 'diarization' is NOT a valid parameter for any Cloudflare Whisper model!
+  const mustUseJson = opts.forceJson === true || isTurboModel || !!normalizedSourceLanguage;
+  const turboBase64Audio = isTurboModel ? arrayBufferToBase64(audioBuffer) : '';
   const sendBinary = async () => {
     response = await fetch(endpoint, {
       method: 'POST',
@@ -1010,13 +1084,33 @@ async function runCloudflareTranscription(audioBlob, opts = {}, ctx = null) {
     });
     raw = await response.text();
   };
-  const sendJsonArray = async () => {
+  const sendJsonPayload = async () => {
     attemptedJson = true;
-    const payload = {
-      audio: Array.from(new Uint8Array(audioBuffer))
-    };
-    if (opts.sourceLanguage) payload.language = opts.sourceLanguage;
-    if (opts.diarization) payload.diarization = true;
+    let payload;
+
+    if (isTurboModel) {
+      // Turbo model (whisper-large-v3-turbo) REQUIRES Base64 encoded audio string
+      // Per Cloudflare docs: audio (string, required): Base64 encoded value of the audio data.
+      payload = { audio: turboBase64Audio };
+      payload.task = 'transcribe';
+      // Only turbo model supports 'language' param.
+      // Cloudflare expects ISO-639-1 style tags (e.g. "ja", not "jpn").
+      if (normalizedSourceLanguage) payload.language = normalizedSourceLanguage;
+      // NOTE: although docs list vad_filter, current Workers AI runtime rejects it for this model.
+      // Keep request schema strict to avoid "Invalid input" failures.
+      if (opts.initialPrompt) payload.initial_prompt = String(opts.initialPrompt);
+      if (opts.prefix) payload.prefix = String(opts.prefix);
+      if (opts.vadFilter === true && ctx?.tabId) {
+        sendDebugLog(ctx.tabId, ctx.messageId, 'Cloudflare turbo: vad_filter requested but omitted due to API invalid-input behavior.', 'info');
+      }
+    } else {
+      // Base model (@cf/openai/whisper) uses array of integers format
+      // Base model does NOT support 'language', 'task', or 'vad_filter' parameters!
+      payload = {
+        audio: Array.from(new Uint8Array(audioBuffer))
+      };
+    }
+
     response = await fetch(endpoint, {
       method: 'POST',
       headers: {
@@ -1031,10 +1125,14 @@ async function runCloudflareTranscription(audioBlob, opts = {}, ctx = null) {
   };
 
   try {
-    // Cloudflare's /ai/run whisper endpoint expects either raw binary audio or a JSON array payload.
-    // Multipart form uploads are not accepted and lead to "Invalid audio input" errors.
-    if (mustUseJson) {
-      await sendJsonArray();
+    // Cloudflare's /ai/run whisper endpoint expects different formats per model:
+    // - Base @cf/openai/whisper: raw binary audio OR JSON with array of integers
+    // - Turbo @cf/openai/whisper-large-v3-turbo: JSON with Base64-encoded audio string (REQUIRED)
+    if (isTurboModel) {
+      // Turbo model: MUST use JSON payload with Base64-encoded audio
+      await sendJsonPayload();
+    } else if (mustUseJson) {
+      await sendJsonPayload();
     } else {
       await sendBinary();
       if (!response?.ok) {
@@ -1047,7 +1145,7 @@ async function runCloudflareTranscription(audioBlob, opts = {}, ctx = null) {
           bodyLower.includes('different language') ||
           bodyLower.includes('language');
         if (retryable && !attemptedJson) {
-          await sendJsonArray();
+          await sendJsonPayload();
         }
       }
     }
@@ -1101,15 +1199,36 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
   let lastStatus = null;
   let lastBody = '';
   let detectedLang = '';
-  let forcedLang = (opts.sourceLanguage || '').trim() || null;
-  const langCandidates = Array.from(new Set(['en', 'ja'])); // common alternates for mixed content
+  let forcedLang = normalizeCloudflareLanguageCode(opts.sourceLanguage) || null;
+  const isTurboModel = (opts.model || '').includes('whisper-large-v3-turbo');
+  // Language candidates for fallback. For base model, only use English since it doesn't support
+  // the language parameter properly. For turbo model or when user explicitly sets a non-English
+  // source language, include that language as a fallback option.
+  const langCandidates = (() => {
+    const candidates = ['en']; // English is always a safe fallback
+    // Only add user's source language if it's different from English and explicitly set
+    if (forcedLang && forcedLang !== 'en' && !candidates.includes(forcedLang)) {
+      candidates.push(forcedLang);
+    }
+    return candidates;
+  })();
   const totalBytes = audioWindows.reduce((sum, w) => sum + (w?.audioBlob?.size || 0), 0);
-  const CF_MAX_WAV_BYTES = 4 * 1024 * 1024; // Guard below observed effective limit despite docs quoting higher
+  // Model-specific audio size limits:
+  // - Base @cf/openai/whisper: 4MB max request body (we use 2.9MB for safety margin)
+  // - Turbo @cf/openai/whisper-large-v3-turbo: max 30 minutes audio
+  // At 16kHz/16-bit mono, that's ~32KB/sec, so:
+  // - Base: ~2.9 MB max (respecting 4MB API limit, allows ~90 seconds per window)
+  // - Turbo: ~48 MB max (25min * 60s * 32KB/s = 48MB, leaving margin from 30min)
+  const CF_MAX_WAV_BYTES = isTurboModel
+    ? 48 * 1024 * 1024  // ~25 minutes for turbo (leaving 5min margin from 30min limit)
+    : Math.round(2.9 * 1024 * 1024);   // ~2.9 MB for base model (respects 4MB limit, ~90 seconds)
   audioWindows.forEach((win, idx) => {
     const size = win?.audioBlob?.size || 0;
     if (size > CF_MAX_WAV_BYTES) {
       const mb = Math.round((size / (1024 * 1024)) * 10) / 10;
-      throw new Error(`Audio window ${idx + 1} is too large for Cloudflare (~${mb} MB > ~5 MB limit); use shorter windows.`);
+      const limitMb = Math.round((CF_MAX_WAV_BYTES / (1024 * 1024)) * 10) / 10;
+      const limitLabel = isTurboModel ? '~25 min' : '~90s';
+      throw new Error(`Audio window ${idx + 1} is too large for Cloudflare ${isTurboModel ? 'Turbo' : 'base'} model (~${mb} MB > ${limitMb} MB / ${limitLabel} limit); use shorter windows.`);
     }
   });
   // Detect language on the first window if not provided
@@ -1130,6 +1249,7 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
         model: opts.model,
         sourceLanguage: undefined,
         diarization: opts.diarization,
+        vadFilter: opts.vadFilter,
         filename: opts.filename ? `${opts.filename}_1.wav` : `audio_1.wav`
       }, ctx);
     } catch (err) {
@@ -1152,6 +1272,7 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
               model: opts.model,
               sourceLanguage: lang,
               diarization: opts.diarization,
+              vadFilter: opts.vadFilter,
               filename: opts.filename ? `${opts.filename}_1.wav` : `audio_1.wav`,
               forceJson: true // ensure language is honored
             }, ctx);
@@ -1174,7 +1295,20 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
     lastStatus = detectRes.status || lastStatus;
     lastBody = detectRes.cfBody || lastBody;
     detectedLang = detectRes.language || '';
-    forcedLang = detectRes.language || forcedLang || null;
+    // Only trust the detected language if:
+    // 1) User explicitly set a source language, OR
+    // 2) The detected language is English (most reliable)
+    // Otherwise, use English as the fallback to avoid wrong language propagation
+    const userSetLang = (opts.sourceLanguage || '').trim();
+    if (detectedLang && detectedLang !== 'en' && !userSetLang) {
+      if (ctx?.tabId) {
+        sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare detected non-English lang='${detectedLang}' but no source language was set; preferring English for stability`, 'info');
+      }
+      // Don't override forcedLang with the detected non-English language
+      forcedLang = 'en';
+    } else {
+      forcedLang = detectRes.language || forcedLang || null;
+    }
     let segs = Array.isArray(detectRes.segments) ? detectRes.segments : [];
     const fallbackText =
       (detectRes.raw && (detectRes.raw.text || detectRes.raw.transcript)) || '';
@@ -1210,31 +1344,42 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
 
   if (!forcedLang) {
     // Fallback to user-provided hint if detection failed
-    forcedLang = (opts.sourceLanguage || '').trim() || null;
+    forcedLang = normalizeCloudflareLanguageCode(opts.sourceLanguage) || null;
   }
 
-  for (let i = startIdx; i < audioWindows.length; i++) {
-    const win = audioWindows[i];
+  // Build language order once (used for all windows)
+  // Priority: 1) auto-detect (null), 2) detected/user-forced lang, 3) fallback candidates
+  const langOrder = (() => {
+    const order = [];
+    const seen = new Set();
+    const push = (lang) => {
+      const key = lang || 'auto';
+      if (seen.has(key)) return;
+      order.push(lang);
+      seen.add(key);
+    };
+    // First: always try auto-detect - let Cloudflare figure it out per window
+    push(null);
+    // Second: try the detected or user-forced language (if any)
+    if (forcedLang) push(forcedLang);
+    // Third: add fallback candidates (English, and optionally user's language if set)
+    langCandidates.forEach(push);
+    return order;
+  })();
+
+  // Log the language order for debugging
+  if (ctx?.tabId) {
+    const langDesc = langOrder.map(l => l || 'auto').join(' → ');
+    sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare language fallback order: ${langDesc}`, 'info');
+  }
+
+  // Helper function to transcribe a single window with retry logic
+  const transcribeWindow = async (win, windowIdx) => {
+    const i = windowIdx;
     const offsetSec = Number(win?.startMs || 0) / 1000;
-    onProgress?.(15 + ((i / audioWindows.length) * 50), `Transcribing window ${i + 1}/${audioWindows.length}...`);
     if (ctx?.tabId) {
       sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare: window ${i + 1}/${audioWindows.length}, offset=${Math.round(offsetSec * 1000) / 1000}s, size=${win?.audioBlob?.size || 0} bytes`, 'info');
     }
-    const langOrder = (() => {
-      const order = [];
-      const seen = new Set();
-      const push = (lang) => {
-        const key = lang || 'auto';
-        if (seen.has(key)) return;
-        order.push(lang);
-        seen.add(key);
-      };
-      // Always allow Cloudflare to auto-detect per window before falling back to hints.
-      push(forcedLang || null);
-      push(null);
-      langCandidates.forEach(push);
-      return order;
-    })();
     let res = null;
     let lastErr = null;
     for (const lang of langOrder) {
@@ -1248,10 +1393,10 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
             model: opts.model,
             sourceLanguage: lang || undefined,
             diarization: opts.diarization,
+            vadFilter: opts.vadFilter,
             filename: opts.filename ? `${opts.filename}_${i + 1}.wav` : `audio_${i + 1}.wav`,
             forceJson: !!lang
           }, ctx);
-          forcedLang = lang || forcedLang; // stick with the last successful language (still allow auto attempts next window)
           if (attempt > 0 && ctx?.tabId) {
             sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare window ${i + 1} succeeded on retry attempt ${attempt + 1} for lang=${lang || 'auto'}.`, 'info');
           }
@@ -1279,13 +1424,11 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
           break;
         }
       }
-      }
-    if (!res) {
-      throw lastErr || new Error('Cloudflare transcription failed for all language attempts');
+      if (res) break; // Exit lang loop if successful
     }
-    lastStatus = res.status || lastStatus;
-    lastBody = res.cfBody || lastBody;
-    detectedLang = res.language || detectedLang || forcedLang || '';
+    if (!res) {
+      throw lastErr || new Error(`Cloudflare transcription failed for window ${i + 1}`);
+    }
     let segs = Array.isArray(res.segments) ? res.segments : [];
     const fallbackText =
       (res.raw && (res.raw.text || res.raw.transcript)) || '';
@@ -1307,9 +1450,112 @@ async function transcribeWindowsWithCloudflare(audioWindows, opts = {}, onProgre
       start: (seg.start || seg.start_time || 0) + offsetSec,
       end: (seg.end || seg.end_time || (Number(seg.start || 0) + 4)) + offsetSec
     }));
-    allSegments.push(...adjusted);
     if (ctx?.tabId) {
       sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare window ${i + 1} complete (${segs.length} segments, offset=${offsetSec.toFixed(3)}s, lang=${res.language || forcedLang || 'n/a'})`, 'info');
+    }
+    return { windowIdx: i, segments: adjusted, status: res.status, cfBody: res.cfBody, language: res.language };
+  };
+
+  // Process remaining windows in parallel with controlled concurrency
+  const remainingWindows = audioWindows.slice(startIdx);
+  const totalRemaining = remainingWindows.length;
+
+  if (totalRemaining > 0) {
+    const MAX_CONCURRENT = 4; // Limit concurrent requests to be respectful of Cloudflare infrastructure
+    let completedCount = 0;
+    let failedCount = 0;
+    const failedWindows = []; // Track which windows failed for logging
+
+    // Log parallel mode start
+    if (ctx?.tabId) {
+      sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare: transcribing ${totalRemaining} window(s) in parallel (max ${MAX_CONCURRENT} concurrent)`, 'info');
+    }
+    onProgress?.(20, `Transcribing ${totalRemaining} windows in parallel...`);
+
+    // Process windows in batches with controlled concurrency
+    const processWithConcurrency = async () => {
+      const results = [];
+      const pending = [];
+      const pendingIndices = []; // Track which window index each pending promise corresponds to
+
+      for (let idx = 0; idx < remainingWindows.length; idx++) {
+        const windowIdx = startIdx + idx;
+        const win = remainingWindows[idx];
+
+        const promise = transcribeWindow(win, windowIdx)
+          .then(result => {
+            completedCount++;
+            const pct = 20 + (((completedCount + failedCount) / totalRemaining) * 45);
+            onProgress?.(pct, `Transcribed ${completedCount}/${totalRemaining} windows...`);
+            return { success: true, result, windowIdx };
+          })
+          .catch(err => {
+            failedCount++;
+            const pct = 20 + (((completedCount + failedCount) / totalRemaining) * 45);
+            onProgress?.(pct, `Transcribed ${completedCount}/${totalRemaining} windows (${failedCount} failed)...`);
+            return { success: false, error: err, windowIdx };
+          });
+
+        pending.push(promise);
+        pendingIndices.push(windowIdx);
+
+        // If we've reached max concurrency, wait for one to complete
+        if (pending.length >= MAX_CONCURRENT) {
+          const settledIdx = await Promise.race(pending.map((p, i) => p.then(() => i).catch(() => i)));
+          const outcome = await pending[settledIdx];
+          if (outcome.success) {
+            results.push(outcome.result);
+          } else {
+            failedWindows.push({ windowIdx: outcome.windowIdx, error: outcome.error?.message || outcome.error });
+          }
+          pending.splice(settledIdx, 1);
+          pendingIndices.splice(settledIdx, 1);
+        }
+      }
+
+      // Wait for all remaining promises
+      const remaining = await Promise.allSettled(pending);
+      for (const result of remaining) {
+        if (result.status === 'fulfilled') {
+          const outcome = result.value;
+          if (outcome.success) {
+            results.push(outcome.result);
+          } else {
+            failedWindows.push({ windowIdx: outcome.windowIdx, error: outcome.error?.message || outcome.error });
+          }
+        }
+        // Note: Promise.allSettled won't have rejected promises since we catch inside
+      }
+
+      return results;
+    };
+
+    const windowResults = await processWithConcurrency();
+
+    // Log summary of failed windows
+    if (failedWindows.length > 0) {
+      const failedList = failedWindows.map(f => `window ${f.windowIdx + 1}`).join(', ');
+      if (ctx?.tabId) {
+        sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare: ${failedWindows.length}/${totalRemaining} window(s) failed and were skipped: ${failedList}`, 'warn');
+        // Log individual errors for debugging
+        for (const f of failedWindows) {
+          sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare window ${f.windowIdx + 1} error: ${f.error}`, 'warn');
+        }
+      }
+      console.warn(`[Cloudflare] ${failedWindows.length}/${totalRemaining} windows failed:`, failedWindows);
+    }
+
+    // Collect results and update tracking variables
+    for (const result of windowResults) {
+      allSegments.push(...result.segments);
+      lastStatus = result.status || lastStatus;
+      lastBody = result.cfBody || lastBody;
+      detectedLang = result.language || detectedLang || forcedLang || '';
+    }
+
+    // Log final success count
+    if (ctx?.tabId && windowResults.length > 0) {
+      sendDebugLog(ctx.tabId, ctx.messageId, `Cloudflare: ${windowResults.length}/${totalRemaining} window(s) transcribed successfully`, 'info');
     }
   }
   allSegments.sort((a, b) => (a.start || 0) - (b.start || 0));
@@ -1733,11 +1979,15 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
         onProgress(10, statusMsg);
         const full = await fetchFullStreamBuffer(streamUrl, (p) => onProgress(10 + p * 0.4, statusMsg), baseHeaders);
         const fullBuf = full?.buffer || full;
+        const probedDur = probeContainerDuration(fullBuf);
+        const estimatedDur = !probedDur && fullBuf?.byteLength
+          ? estimateDurationFromBytes(fullBuf.byteLength)
+          : null;
         sample = {
           ...full,
           buffer: fullBuf,
           partial: false,
-          durationSec: probeContainerDuration(fullBuf) || detectedDuration || null
+          durationSec: probedDur || detectedDuration || estimatedDur || null
         };
         if (sample?.durationSec && !detectedDuration) {
           detectedDuration = sample.durationSec;
@@ -1745,7 +1995,8 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
         fullFetchedUpfront = true;
         if (ctx?.tabId) {
           const sizeMb = fullBuf?.byteLength ? Math.round(fullBuf.byteLength / (1024 * 1024)) : 'unknown';
-          sendDebugLog(ctx.tabId, ctx.messageId, `Complete mode: fetched full stream first (~${sizeMb} MB)`, 'info');
+          const durSource = probedDur ? 'container' : (estimatedDur ? 'estimated from size' : 'none');
+          sendDebugLog(ctx.tabId, ctx.messageId, `Complete mode: fetched full stream first (~${sizeMb} MB, duration source: ${durSource})`, 'info');
         }
       } catch (fullErr) {
         console.warn('[Background] Upfront full fetch failed, falling back to ranged sample:', fullErr?.message || fullErr);
@@ -1784,20 +2035,25 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
         try {
           const full = await fetchFullStreamBuffer(streamUrl, (p) => onProgress(48 + p * 0.18, statusMsg), baseHeaders);
           const fullBuf = full?.buffer || full;
+          const probedDur = probeContainerDuration(fullBuf);
+          const estimatedDur = !probedDur && fullBuf?.byteLength
+            ? estimateDurationFromBytes(fullBuf.byteLength)
+            : null;
           sample = {
             ...sample,
             ...full,
             buffer: fullBuf,
             partial: false,
             totalBytes: full?.totalBytes || declaredTotal || null,
-            durationSec: probeContainerDuration(fullBuf) || sample?.durationSec || detectedDuration || null
+            durationSec: probedDur || sample?.durationSec || detectedDuration || estimatedDur || null
           };
           if (sample?.durationSec && !detectedDuration) {
             detectedDuration = sample.durationSec;
           }
           if (ctx?.tabId) {
             const sizeMb = fullBuf?.byteLength ? Math.round(fullBuf.byteLength / (1024 * 1024)) : 'unknown';
-            sendDebugLog(ctx.tabId, ctx.messageId, `Full stream fetched (~${sizeMb} MB); continuing with complete buffer`, 'info');
+            const durSource = probedDur ? 'container' : (estimatedDur ? 'estimated' : 'none');
+            sendDebugLog(ctx.tabId, ctx.messageId, `Full stream fetched (~${sizeMb} MB, dur: ${durSource}); continuing with complete buffer`, 'info');
           }
         } catch (fullErr) {
           console.warn('[Background] Full fetch fallback failed:', fullErr?.message || fullErr);
@@ -2011,9 +2267,10 @@ async function handleAutoSubRequest(message, tabId) {
   const cfAccountId = data.cfAccountId || data.accountId;
   const cfToken = data.cfToken || data.token;
   const model = data.model || '@cf/openai/whisper';
-  let sourceLanguage = (data.sourceLanguage || data.language || '').trim();
+  let sourceLanguage = normalizeCloudflareLanguageCode(data.sourceLanguage || data.language) || '';
   const requestedTrackIndex = Number.isInteger(data.audioTrackIndex) ? data.audioTrackIndex : null;
   const diarization = data.diarization === true;
+  const vadFilter = data.vadFilter === true; // VAD filter for turbo model
   const pageHeaders = data.pageHeaders || null;
   const ctx = { tabId, messageId, pageHeaders };
 
@@ -2025,16 +2282,22 @@ async function handleAutoSubRequest(message, tabId) {
   }
 
   try {
+    const isTurboModel = (model || '').includes('whisper-large-v3-turbo');
     const host = (() => { try { return new URL(streamUrl || '').hostname; } catch (_) { return streamUrl || ''; } })();
-    sendDebugLog(tabId, messageId, `Auto-sub request received (model=${model}, diarization=${diarization}) host=${host || 'n/a'}`, 'info');
+    sendDebugLog(tabId, messageId, `Auto-sub request received (model=${model}${isTurboModel && vadFilter ? ', vad=on' : ''}) host=${host || 'n/a'}`, 'info');
     const rawWindowMb = typeof data.cfWindowSizeMb === 'number' ? data.cfWindowSizeMb : parseFloat(data.cfWindowSizeMb);
-    const cfWindowMb = Number.isFinite(rawWindowMb) && rawWindowMb > 0 ? Math.min(Math.max(rawWindowMb, 1), 25) : null;
+    // Model-specific window size limits:
+    // - Base @cf/openai/whisper: 4MB max request body (~90 seconds at 32KB/s)
+    // - Turbo @cf/openai/whisper-large-v3-turbo: max 30 minutes audio (we use 25min for safety margin)
+    const maxWindowSecForModel = isTurboModel ? 1500 : 90; // 25min for turbo, ~90s for base (2.9MB limit)
+    const defaultWindowSec = isTurboModel ? 90 : 90; // 90s default for both turbo and base
+    const cfWindowMb = Number.isFinite(rawWindowMb) && rawWindowMb > 0 ? Math.min(Math.max(rawWindowMb, 1), isTurboModel ? 48 : 2.9) : null;
     const cfWindowCapSec = (() => {
-      if (!cfWindowMb) return 90; // default ~2.9 MB at 16k/16-bit mono (~90s)
+      if (!cfWindowMb) return defaultWindowSec;
       const bytes = cfWindowMb * 1024 * 1024;
       const bytesPerSecond = 32000; // 16kHz * 16-bit mono
       const seconds = Math.round(bytes / bytesPerSecond);
-      return Math.min(Math.max(seconds, 15), 600); // clamp between 15s and 10min
+      return Math.min(Math.max(seconds, 15), maxWindowSecForModel); // clamp between 15s and model max
     })();
     const planInput = {
       preset: 'complete',
@@ -2059,7 +2322,7 @@ async function handleAutoSubRequest(message, tabId) {
     }
     const { preferred, ordered } = pickPreferredAudioTrack(audioTracks, sourceLanguage || 'en');
     if (!sourceLanguage && preferred?.language) {
-      sourceLanguage = preferred.language;
+      sourceLanguage = normalizeCloudflareLanguageCode(preferred.language) || '';
     }
 
     let userSelectedTrack = requestedTrackIndex !== null;
@@ -2122,7 +2385,7 @@ async function handleAutoSubRequest(message, tabId) {
         const audioWindows = await extractForTrack(audioStreamIndex);
         const transcript = await transcribeWindowsWithCloudflare(
           audioWindows,
-          { accountId: cfAccountId, token: cfToken, model, sourceLanguage, diarization, filename: data.filename || 'audio' },
+          { accountId: cfAccountId, token: cfToken, model, sourceLanguage, diarization, vadFilter, filename: data.filename || 'audio' },
           (p, status) => sendAutoSubProgress(tabId, messageId, Math.min(92, Math.round(p)), status || 'Transcribing...', 'transcribe'),
           ctx
         );
@@ -2188,7 +2451,168 @@ async function uploadToAssemblyFromBlob(apiKey, blob, logger) {
   return data.upload_url;
 }
 
+/**
+ * Normalize language codes to AssemblyAI's supported format.
+ * AssemblyAI uses mostly ISO 639-1 codes with some regional variants.
+ * @param {string} lang - Input language code (e.g., 'jpn', 'ja', 'japanese', 'chi', 'zh')
+ * @returns {string|null} - AssemblyAI-compatible code or null if not supported
+ */
+function normalizeToAssemblyAILanguage(lang) {
+  if (!lang) return null;
+  const input = String(lang).toLowerCase().trim();
+  if (!input) return null;
+
+  // AssemblyAI supported language codes (direct matches)
+  const assemblyAI_SUPPORTED = new Set([
+    'en', 'en_au', 'en_uk', 'en_us', 'es', 'fr', 'de', 'it', 'pt', 'nl', 'hi', 'ja', 'zh',
+    'fi', 'ko', 'pl', 'ru', 'tr', 'uk', 'vi', 'af', 'sq', 'am', 'ar', 'hy', 'as', 'az',
+    'ba', 'eu', 'be', 'bn', 'bs', 'br', 'bg', 'my', 'ca', 'hr', 'cs', 'da', 'et', 'fo',
+    'gl', 'ka', 'el', 'gu', 'ht', 'ha', 'haw', 'he', 'hu', 'is', 'id', 'jw', 'kn', 'kk',
+    'km', 'lo', 'la', 'lv', 'ln', 'lt', 'lb', 'mk', 'mg', 'ms', 'ml', 'mt', 'mi', 'mr',
+    'mn', 'ne', 'no', 'nn', 'oc', 'pa', 'ps', 'fa', 'ro', 'sa', 'sr', 'sn', 'sd', 'si',
+    'sk', 'sl', 'so', 'su', 'sw', 'sv', 'tl', 'tg', 'ta', 'tt', 'te', 'th', 'bo', 'tk',
+    'ur', 'uz', 'cy', 'yi', 'yo'
+  ]);
+
+  // ISO 639-2/B and ISO 639-2/T to AssemblyAI code mappings
+  const ISO_639_2_TO_ASSEMBLY = {
+    // Common ISO 639-2 codes that differ from ISO 639-1
+    'jpn': 'ja', 'jap': 'ja', 'japanese': 'ja',
+    'zho': 'zh', 'chi': 'zh', 'chinese': 'zh', 'cmn': 'zh', 'mandarin': 'zh',
+    'kor': 'ko', 'korean': 'ko',
+    'deu': 'de', 'ger': 'de', 'german': 'de',
+    'fra': 'fr', 'fre': 'fr', 'french': 'fr',
+    'spa': 'es', 'spanish': 'es',
+    'por': 'pt', 'portuguese': 'pt',
+    'rus': 'ru', 'russian': 'ru',
+    'ara': 'ar', 'arabic': 'ar',
+    'hin': 'hi', 'hindi': 'hi',
+    'ita': 'it', 'italian': 'it',
+    'nld': 'nl', 'dut': 'nl', 'dutch': 'nl',
+    'pol': 'pl', 'polish': 'pl',
+    'tur': 'tr', 'turkish': 'tr',
+    'ukr': 'uk', 'ukrainian': 'uk',
+    'vie': 'vi', 'vietnamese': 'vi',
+    'fin': 'fi', 'finnish': 'fi',
+    'afr': 'af', 'afrikaans': 'af',
+    'sqi': 'sq', 'alb': 'sq', 'albanian': 'sq',
+    'amh': 'am', 'amharic': 'am',
+    'hye': 'hy', 'arm': 'hy', 'armenian': 'hy',
+    'asm': 'as', 'assamese': 'as',
+    'aze': 'az', 'azerbaijani': 'az',
+    'bak': 'ba', 'bashkir': 'ba',
+    'eus': 'eu', 'baq': 'eu', 'basque': 'eu',
+    'bel': 'be', 'belarusian': 'be',
+    'ben': 'bn', 'bengali': 'bn',
+    'bos': 'bs', 'bosnian': 'bs',
+    'bre': 'br', 'breton': 'br',
+    'bul': 'bg', 'bulgarian': 'bg',
+    'mya': 'my', 'bur': 'my', 'burmese': 'my',
+    'cat': 'ca', 'catalan': 'ca',
+    'hrv': 'hr', 'croatian': 'hr',
+    'ces': 'cs', 'cze': 'cs', 'czech': 'cs',
+    'dan': 'da', 'danish': 'da',
+    'est': 'et', 'estonian': 'et',
+    'fao': 'fo', 'faroese': 'fo',
+    'glg': 'gl', 'galician': 'gl',
+    'kat': 'ka', 'geo': 'ka', 'georgian': 'ka',
+    'ell': 'el', 'gre': 'el', 'greek': 'el',
+    'guj': 'gu', 'gujarati': 'gu',
+    'hat': 'ht', 'haitian': 'ht',
+    'hau': 'ha', 'hausa': 'ha',
+    'heb': 'he', 'hebrew': 'he',
+    'hun': 'hu', 'hungarian': 'hu',
+    'isl': 'is', 'ice': 'is', 'icelandic': 'is',
+    'ind': 'id', 'indonesian': 'id',
+    'jav': 'jw', 'javanese': 'jw',
+    'kan': 'kn', 'kannada': 'kn',
+    'kaz': 'kk', 'kazakh': 'kk',
+    'khm': 'km', 'khmer': 'km', 'cambodian': 'km',
+    'lao': 'lo',
+    'lat': 'la', 'latin': 'la',
+    'lav': 'lv', 'latvian': 'lv',
+    'lin': 'ln', 'lingala': 'ln',
+    'lit': 'lt', 'lithuanian': 'lt',
+    'ltz': 'lb', 'luxembourgish': 'lb',
+    'mkd': 'mk', 'mac': 'mk', 'macedonian': 'mk',
+    'mlg': 'mg', 'malagasy': 'mg',
+    'msa': 'ms', 'may': 'ms', 'malay': 'ms',
+    'mal': 'ml', 'malayalam': 'ml',
+    'mlt': 'mt', 'maltese': 'mt',
+    'mri': 'mi', 'mao': 'mi', 'maori': 'mi',
+    'mar': 'mr', 'marathi': 'mr',
+    'mon': 'mn', 'mongolian': 'mn',
+    'nep': 'ne', 'nepali': 'ne',
+    'nor': 'no', 'norwegian': 'no',
+    'nno': 'nn',
+    'oci': 'oc', 'occitan': 'oc',
+    'pan': 'pa', 'panjabi': 'pa', 'punjabi': 'pa',
+    'pus': 'ps', 'pashto': 'ps',
+    'fas': 'fa', 'per': 'fa', 'persian': 'fa', 'farsi': 'fa',
+    'ron': 'ro', 'rum': 'ro', 'romanian': 'ro',
+    'san': 'sa', 'sanskrit': 'sa',
+    'srp': 'sr', 'serbian': 'sr',
+    'sna': 'sn', 'shona': 'sn',
+    'snd': 'sd', 'sindhi': 'sd',
+    'sin': 'si', 'sinhala': 'si', 'sinhalese': 'si',
+    'slk': 'sk', 'slo': 'sk', 'slovak': 'sk',
+    'slv': 'sl', 'slovenian': 'sl',
+    'som': 'so', 'somali': 'so',
+    'sun': 'su', 'sundanese': 'su',
+    'swa': 'sw', 'swahili': 'sw',
+    'swe': 'sv', 'swedish': 'sv',
+    'tgl': 'tl', 'tagalog': 'tl', 'fil': 'tl', 'filipino': 'tl',
+    'tgk': 'tg', 'tajik': 'tg',
+    'tam': 'ta', 'tamil': 'ta',
+    'tat': 'tt', 'tatar': 'tt',
+    'tel': 'te', 'telugu': 'te',
+    'tha': 'th', 'thai': 'th',
+    'bod': 'bo', 'tib': 'bo', 'tibetan': 'bo',
+    'tuk': 'tk', 'turkmen': 'tk',
+    'urd': 'ur', 'urdu': 'ur',
+    'uzb': 'uz', 'uzbek': 'uz',
+    'cym': 'cy', 'wel': 'cy', 'welsh': 'cy',
+    'yid': 'yi', 'yiddish': 'yi',
+    'yor': 'yo', 'yoruba': 'yo',
+    'eng': 'en', 'english': 'en',
+    'und': null, 'unknown': null, 'undetermined': null
+  };
+
+  // Check if already a supported code
+  if (assemblyAI_SUPPORTED.has(input)) {
+    return input;
+  }
+
+  // Check if it's an ISO 639-2 code or language name that needs mapping
+  if (ISO_639_2_TO_ASSEMBLY.hasOwnProperty(input)) {
+    return ISO_639_2_TO_ASSEMBLY[input];
+  }
+
+  // Handle regional variants (e.g., 'en-US' -> 'en_us', 'pt-BR' -> 'pt')
+  const dashMatch = input.match(/^([a-z]{2,3})[-_]([a-z]{2})$/i);
+  if (dashMatch) {
+    const base = dashMatch[1].toLowerCase();
+    const region = dashMatch[2].toLowerCase();
+    // Check for specific English variants
+    if (base === 'en') {
+      if (region === 'au') return 'en_au';
+      if (region === 'gb' || region === 'uk') return 'en_uk';
+      if (region === 'us') return 'en_us';
+      return 'en';
+    }
+    // For other languages, just use the base code
+    const normalizedBase = ISO_639_2_TO_ASSEMBLY[base] || (assemblyAI_SUPPORTED.has(base) ? base : null);
+    if (normalizedBase) return normalizedBase;
+  }
+
+  // Not found - return null to trigger auto-detection
+  return null;
+}
+
 async function createAssemblyTranscriptClient(apiKey, payload = {}, logger) {
+  // Normalize language code to AssemblyAI format
+  const normalizedLang = normalizeToAssemblyAILanguage(payload.language_code);
+
   const body = {
     punctuate: true,
     format_text: true,
@@ -2196,10 +2620,16 @@ async function createAssemblyTranscriptClient(apiKey, payload = {}, logger) {
     disfluencies: true,
     audio_url: payload.audio_url
   };
-  if (payload.language_code) {
-    body.language_code = payload.language_code;
+
+  // Use normalized language if available, otherwise enable auto-detection
+  if (normalizedLang) {
+    body.language_code = normalizedLang;
+    logger?.(`Using language code: ${normalizedLang} (from: ${payload.language_code})`, 'info');
   } else {
     body.language_detection = true;
+    if (payload.language_code) {
+      logger?.(`Language '${payload.language_code}' not supported by AssemblyAI, using auto-detection`, 'warn');
+    }
   }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30000);
@@ -2256,6 +2686,87 @@ async function fetchAssemblySrtClient(apiKey, transcriptId, logger) {
     return '';
   }
   return await resp.text();
+}
+
+/**
+ * Group raw AssemblyAI words into sentence-like segments when utterances are unavailable.
+ * Creates segments by splitting on sentence-ending punctuation and natural pauses (>600ms).
+ */
+function groupWordsIntoSegments(words) {
+  if (!Array.isArray(words) || !words.length) return [];
+  const PAUSE_THRESHOLD_MS = 600;
+  const segments = [];
+  let buf = [];
+  let segStartMs = null;
+  let segEndMs = null;
+
+  const flush = () => {
+    if (!buf.length) return;
+    segments.push({
+      start: (segStartMs || 0) / 1000,
+      end: (segEndMs || segStartMs || 0) / 1000,
+      text: buf.map(w => w.text).join(' '),
+      words: buf.map(w => ({
+        text: w.text,
+        start: (w.start || 0) / 1000,
+        end: (w.end || 0) / 1000
+      }))
+    });
+    buf = [];
+    segStartMs = null;
+    segEndMs = null;
+  };
+
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (!w || !w.text) continue;
+    if (segStartMs === null) segStartMs = w.start || 0;
+    segEndMs = w.end || w.start || segEndMs || 0;
+    buf.push(w);
+
+    const endsWithPunctuation = /[.!?]$/.test(w.text);
+    const nextWord = words[i + 1];
+    const gap = nextWord ? (nextWord.start || 0) - (w.end || 0) : 0;
+    const longPause = gap >= PAUSE_THRESHOLD_MS;
+
+    if (endsWithPunctuation || longPause) {
+      flush();
+    }
+  }
+  flush();
+  return segments;
+}
+
+/**
+ * Convert AssemblyAI transcript response into normalized segments
+ * suitable for buildReadableCues() → segmentsToReadableSrt().
+ * Prefers utterances (speaker-grouped, sentence-like) over raw words.
+ * AssemblyAI timestamps are in milliseconds; we convert to seconds.
+ */
+function assemblyTranscriptToSegments(data) {
+  if (!data) return [];
+
+  // Prefer utterances: they are speaker-grouped and sentence-boundary aligned
+  if (Array.isArray(data.utterances) && data.utterances.length) {
+    return data.utterances.map(u => ({
+      start: (u.start || 0) / 1000,
+      end: (u.end || 0) / 1000,
+      text: (u.text || '').trim(),
+      speaker: u.speaker || null,
+      words: Array.isArray(u.words) ? u.words.map(w => ({
+        text: w.text || '',
+        start: (w.start || 0) / 1000,
+        end: (w.end || 0) / 1000
+      })) : null
+    })).filter(s => s.text);
+  }
+
+  // Fallback: use top-level words array, group into sentence-like segments
+  if (Array.isArray(data.words) && data.words.length) {
+    return groupWordsIntoSegments(data.words);
+  }
+
+  return [];
 }
 
 async function handleAssemblyAutoSubRequest(message, tabId) {
@@ -2380,7 +2891,7 @@ async function handleAssemblyAutoSubRequest(message, tabId) {
     const uploadUrl = await uploadToAssemblyFromBlob(apiKey, uploadBlob, (msg, lvl) => logToPage(msg, lvl || 'info'));
     const transcriptId = await createAssemblyTranscriptClient(apiKey, {
       audio_url: uploadUrl,
-      language_code: sourceLanguage,
+      language_code: sourceLanguage, // Will be normalized to AssemblyAI format (e.g., 'jpn' -> 'ja')
       speaker_labels: diarization !== false
     }, (msg, lvl) => logToPage(msg, lvl || 'info'));
     logToPage(`AssemblyAI transcript id: ${transcriptId}`, 'info');
@@ -2389,13 +2900,34 @@ async function handleAssemblyAutoSubRequest(message, tabId) {
     if (!sourceLanguage && transcriptData?.language) {
       sourceLanguage = transcriptData.language;
     }
-    progress(92, 'Fetching SRT...', 'package');
-    const assemblySrt = await fetchAssemblySrtClient(apiKey, transcriptId, (msg, lvl) => logToPage(msg, lvl || 'info'));
-    const srt = assemblySrt || '';
-    if (!srt) throw new Error('AssemblyAI returned no SRT');
+    progress(90, 'Building readable subtitles from transcript...', 'package');
+
+    // Build readable SRT from utterances/words using the same pipeline as Cloudflare
+    const segments = assemblyTranscriptToSegments(transcriptData);
+    let srt = '';
+    let rawAssemblySrt = '';
+
+    if (segments.length) {
+      srt = segmentsToReadableSrt(segments);
+      logToPage(`Built readable SRT from ${segments.length} transcript segments (${(transcriptData.utterances || []).length} utterances, ${(transcriptData.words || []).length} words)`, 'info');
+    }
+
+    // Fallback: fetch pre-built SRT from AssemblyAI if segment-based SRT failed
+    if (!srt) {
+      logToPage('No segments available, falling back to AssemblyAI pre-built SRT', 'warn');
+      srt = await fetchAssemblySrtClient(apiKey, transcriptId, (msg, lvl) => logToPage(msg, lvl || 'info'));
+    } else {
+      // Still fetch the pre-built SRT for debug/comparison
+      try {
+        rawAssemblySrt = await fetchAssemblySrtClient(apiKey, transcriptId, (msg, lvl) => logToPage(msg, lvl || 'info'));
+      } catch (_) { /* non-critical */ }
+    }
+
+    if (!srt) throw new Error('AssemblyAI returned no usable transcript');
     progress(98, 'Transcript ready. Finalizing...', 'package');
     const transcriptPayload = {
       srt,
+      rawAssemblySrt: rawAssemblySrt || undefined,
       languageCode: sourceLanguage || transcriptData?.language || 'und',
       model: 'assemblyai',
       assemblyId: transcriptId,
@@ -2756,7 +3288,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
     sendDebugLog(tabId, messageId, `${modeLabel}: sample ready (~${sampleMb} MB, partial=${sample?.partial ? 'yes' : 'no'})`, 'info');
     sendExtractProgress(tabId, messageId, 75, `${modeLabel}: demuxing sample...`);
     try {
-    const tracks = applyLangHints(await demuxSubtitlesOffscreen(buffer, messageId, tabId), sample?.subtitleLangs);
+      const tracks = applyLangHints(await demuxSubtitlesOffscreen(buffer, messageId, tabId), sample?.subtitleLangs);
       const durationSec = sample?.durationSec || probeContainerDuration(buffer) || null;
       const { summary } = evaluateTracks(tracks, durationSec, sample?.partial === true, 'demux');
       const lastCueText = summary?.lastCueSec ? `; last cue at ${Math.round(summary.lastCueSec)}s` : '';
@@ -3939,6 +4471,9 @@ const READABLE_SRT_CPS_SLOW = 12; // For denser languages like CJK
 const READABLE_PAUSE_SPLIT_MS = 450;
 const READABLE_GAP_ABSORB_MS = 400;
 const READABLE_OVERLAP_TOLERANCE_MS = 120;
+const READABLE_SRT_MIN_WORD_TIMED_MS = 280;
+const READABLE_WORD_HOLD_MS = 160;
+const READABLE_WORD_MAX_HOLD_MS = 420;
 
 function cueCpsForLanguage(lang = '') {
   const lc = String(lang || '').toLowerCase();
@@ -4110,8 +4645,85 @@ function wrapCueLines(text, maxLine = READABLE_SRT_MAX_LINE, maxLines = READABLE
   return reflow.join('\n');
 }
 
-function distributeCueTimings(chunks, startMs, endMs, lang = '') {
+function normalizeCueWordTimings(seg = null) {
+  const words = Array.isArray(seg?.words) ? seg.words : null;
+  if (!words || !words.length) return [];
+  return words
+    .map((w) => {
+      const startMs = Number.isFinite(w?.startMs) ? w.startMs : Number(w?.start || 0) * 1000;
+      const endMs = Number.isFinite(w?.endMs) ? w.endMs : Number(w?.end || 0) * 1000;
+      const text = String(w?.text || w?.word || '').trim();
+      return { startMs, endMs, text };
+    })
+    .filter((w) => Number.isFinite(w.startMs) && Number.isFinite(w.endMs) && w.endMs > w.startMs && w.text)
+    .sort((a, b) => a.startMs - b.startMs);
+}
+
+function distributeCueTimingsByWords(chunks, startMs, endMs, seg = null, lang = '') {
   if (!Array.isArray(chunks) || !chunks.length) return [];
+  const words = normalizeCueWordTimings(seg);
+  if (!words.length) return [];
+
+  const chunkTargets = chunks.map((chunk) => Math.max(1, String(chunk || '').split(/\s+/).filter(Boolean).length));
+  const targetTotal = chunkTargets.reduce((sum, n) => sum + n, 0) || chunkTargets.length;
+  const spans = [];
+  let cursor = 0;
+
+  for (let i = 0; i < chunks.length; i++) {
+    const remainingWords = words.length - cursor;
+    const remainingChunks = chunks.length - i;
+    if (remainingWords <= 0) break;
+    if (i === chunks.length - 1) {
+      spans.push({ startIdx: cursor, endIdx: words.length - 1 });
+      cursor = words.length;
+      break;
+    }
+    const proportional = Math.round((words.length * chunkTargets[i]) / targetTotal);
+    const maxTake = Math.max(1, remainingWords - (remainingChunks - 1));
+    const take = Math.min(maxTake, Math.max(1, proportional));
+    spans.push({ startIdx: cursor, endIdx: cursor + take - 1 });
+    cursor += take;
+  }
+
+  if (!spans.length) return [];
+  const cps = cueCpsForLanguage(lang);
+  const timed = [];
+  let lastEnd = Math.max(0, Number(startMs) || 0);
+
+  for (let i = 0; i < spans.length; i++) {
+    const span = spans[i];
+    const chunkText = chunks[i] || '';
+    const first = words[span.startIdx];
+    const last = words[span.endIdx];
+    if (!first || !last) continue;
+
+    let cueStart = Math.max(lastEnd, Math.round(first.startMs));
+    const nextWord = words[span.endIdx + 1] || null;
+    const nextBarrier = nextWord ? Math.round(nextWord.startMs) - 20 : Math.round(endMs);
+    const readableTail = Math.round((Math.max(chunkText.length, 1) / cps) * 120);
+    const hold = Math.max(READABLE_WORD_HOLD_MS, Math.min(READABLE_WORD_MAX_HOLD_MS, readableTail));
+    let cueEnd = Math.round(last.endMs) + hold;
+
+    if (Number.isFinite(nextBarrier) && nextBarrier > cueStart + 80) {
+      cueEnd = Math.min(cueEnd, nextBarrier);
+    }
+
+    const minDur = READABLE_SRT_MIN_WORD_TIMED_MS;
+    cueEnd = Math.max(cueStart + minDur, cueEnd);
+    cueEnd = Math.min(Math.round(endMs), cueEnd);
+    if (cueEnd <= cueStart) cueEnd = cueStart + minDur;
+
+    timed.push({ startMs: cueStart, endMs: cueEnd, text: chunkText });
+    lastEnd = cueEnd;
+  }
+
+  return timed;
+}
+
+function distributeCueTimings(chunks, startMs, endMs, lang = '', seg = null) {
+  if (!Array.isArray(chunks) || !chunks.length) return [];
+  const wordTimed = distributeCueTimingsByWords(chunks, startMs, endMs, seg, lang);
+  if (wordTimed.length) return wordTimed;
   const spanMs = Math.max(READABLE_SRT_MIN_MS, endMs - startMs);
   const cps = cueCpsForLanguage(lang);
   let durations = chunks.map((c) => {
@@ -4169,17 +4781,17 @@ function buildReadableCues(segments) {
 
     // absorb micro gaps to keep flow tight, but keep clear separation on speaker switch
     let segStart = seg.startMs;
-    if (gapFromLast <= READABLE_GAP_ABSORB_MS && gapFromLast >= 0) {
-      segStart = sameSpeakerAsPrev ? Math.max(seg.startMs, lastEndMs) : lastEndMs;
+    if (gapFromLast <= READABLE_GAP_ABSORB_MS && gapFromLast >= 0 && sameSpeakerAsPrev) {
+      segStart = Math.max(seg.startMs, lastEndMs);
     } else if (gapFromLast < 0) {
-      segStart = lastEndMs;
+      segStart = Math.max(seg.startMs, lastEndMs);
     }
 
     let segEnd = Math.max(segStart + READABLE_SRT_MIN_MS, seg.endMs);
 
     const chunks = splitTextIntoChunks(seg.text, seg);
     if (!chunks.length) return;
-    const timedChunks = distributeCueTimings(chunks, segStart, segEnd, seg.language);
+    const timedChunks = distributeCueTimings(chunks, segStart, segEnd, seg.language, seg);
     for (const chunk of timedChunks) {
       let cueStart = Math.max(chunk.startMs, lastEndMs);
       let cueEnd = Math.min(segEnd, Math.max(cueStart + 300, chunk.endMs));
@@ -4636,11 +5248,11 @@ function probeMp4Duration(buffer) {
 }
 
 const SYNC_PLAN_DEFAULTS = {
-  quick:   { coveragePct: 0.05, minWindows: 3, maxWindows: 5, windowSeconds: 45, legacyMode: 'quick' },
-  smart:   { coveragePct: 0.1,  minWindows: 4, maxWindows: 7, windowSeconds: 60, legacyMode: 'fast' },
-  long:    { coveragePct: 0.18, minWindows: 6, maxWindows: 10, windowSeconds: 75, legacyMode: 'complete' },
-  thorough:{ coveragePct: 0.32, minWindows: 8, maxWindows: 14, windowSeconds: 90, legacyMode: 'complete' },
-  complete:{ coveragePct: 1,    minWindows: null, maxWindows: null, windowSeconds: null, legacyMode: 'complete', fullScan: true }
+  quick: { coveragePct: 0.05, minWindows: 3, maxWindows: 5, windowSeconds: 45, legacyMode: 'quick' },
+  smart: { coveragePct: 0.1, minWindows: 4, maxWindows: 7, windowSeconds: 60, legacyMode: 'fast' },
+  long: { coveragePct: 0.18, minWindows: 6, maxWindows: 10, windowSeconds: 75, legacyMode: 'complete' },
+  thorough: { coveragePct: 0.32, minWindows: 8, maxWindows: 14, windowSeconds: 90, legacyMode: 'complete' },
+  complete: { coveragePct: 1, minWindows: null, maxWindows: null, windowSeconds: null, legacyMode: 'complete', fullScan: true }
 };
 const PLAN_MIN_WINDOW_SECONDS = 20;
 const PLAN_MAX_WINDOW_SECONDS = 7200;
@@ -4763,13 +5375,21 @@ function adaptPlanToDuration(plan, durationSeconds) {
 
 function planWindows(totalDurationSec, plan) {
   const effective = adaptPlanToDuration(plan, totalDurationSec);
+  const maxChunkSeconds = Number.isFinite(effective.maxChunkSeconds) ? effective.maxChunkSeconds : null;
+  const requestedWindowSeconds = Number.isFinite(effective.requestedWindowSeconds) ? effective.requestedWindowSeconds : null;
+
+  // When fullScan is true and no duration is detected, fallback to maxChunkSeconds or requestedWindowSeconds
+  // This is critical for TS containers (transport streams) where duration probing fails
+  const fullScanFallbackDuration = effective.fullScan
+    ? (maxChunkSeconds || requestedWindowSeconds || PLAN_FULLSCAN_DEFAULT_CHUNK_CAP)
+    : 0;
+
   const inferred = totalDurationSec
     || effective.coverageSeconds
     || (Number.isFinite(effective.windowSeconds) && Number.isFinite(effective.windowCount)
       ? Math.max(effective.windowSeconds * effective.windowCount * 1.1, effective.windowSeconds * 3)
-      : 0);
+      : fullScanFallbackDuration);
   const dur = Math.max(60, inferred || 0);
-  const maxChunkSeconds = Number.isFinite(effective.maxChunkSeconds) ? effective.maxChunkSeconds : null;
 
   if (effective.fullScan) {
     const chunkCap = maxChunkSeconds || PLAN_FULLSCAN_DEFAULT_CHUNK_CAP;
@@ -5493,6 +6113,30 @@ function probeMkvDuration(buffer) {
 function probeContainerDuration(buffer) {
   return probeMp4Duration(buffer) || probeMkvDuration(buffer);
 }
+
+/**
+ * Estimate video duration from file size as a last-resort fallback.
+ * Uses a conservative 0.8 Mbps average bitrate estimate, which errs on the
+ * side of longer durations (better to have extra windows than miss content).
+ * This is primarily used for TS (transport stream) containers where duration
+ * probing from headers fails. A lower bitrate assumption means we estimate
+ * longer durations, ensuring full coverage for lower-quality or well-compressed streams.
+ * @param {number} bytes - File size in bytes
+ * @returns {number|null} - Estimated duration in seconds, or null if invalid
+ */
+function estimateDurationFromBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return null;
+  // Conservative estimate: 0.8 Mbps average bitrate (errs toward longer duration)
+  // This ensures we don't underestimate duration for well-compressed content
+  // 0.8 Mbps covers most web-optimized 480p-720p content; higher quality will have
+  // extra windows at the end (which is harmless) rather than missing final content
+  const avgBitsPerSecond = 0.8 * 1024 * 1024; // 0.8 Mbps
+  const estimatedSec = (bytes * 8) / avgBitsPerSecond;
+  // Clamp to reasonable bounds (1 second to 8 hours for long movies/series)
+  if (estimatedSec < 1) return null;
+  return Math.min(estimatedSec, 8 * 3600);
+}
+
 
 async function probeDurationHead(url, baseHeaders = null) {
   try {
@@ -6974,17 +7618,17 @@ async function demuxSubtitlesOffscreen(buffer, messageId, tabId) {
           }
 
           // If the offscreen page vanished, recreate it and retry once.
-        if (isMissingOffscreenReceiver(err) && attempt === 0) {
-          console.warn('[Background][Offscreen] Demux receiver missing; recreating offscreen document and retrying', {
-            messageId,
-            error: err?.message
-          });
-          _offscreenCreated = false;
-          _offscreenReady = false;
-          try { await forceCloseOffscreenDocument('missing-offscreen-retry'); } catch (_) { }
-          await ensureOffscreenDocument(true);
-          continue;
-        }
+          if (isMissingOffscreenReceiver(err) && attempt === 0) {
+            console.warn('[Background][Offscreen] Demux receiver missing; recreating offscreen document and retrying', {
+              messageId,
+              error: err?.message
+            });
+            _offscreenCreated = false;
+            _offscreenReady = false;
+            try { await forceCloseOffscreenDocument('missing-offscreen-retry'); } catch (_) { }
+            await ensureOffscreenDocument(true);
+            continue;
+          }
 
           // Non-retryable error
           throw err;
