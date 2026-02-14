@@ -10,6 +10,7 @@
   const state = {
     loading: null,
     api: null,
+    bindgen: null,
   };
 
   async function loadGlueAndWasm({ wasmPath }) {
@@ -17,26 +18,31 @@
     if (state.loading) return state.loading;
 
     state.loading = (async () => {
-      const glueUrl = global.chrome?.runtime?.getURL
-        ? chrome.runtime.getURL('assets/lib/ffsubsync_wasm.js')
-        : 'ffsubsync_wasm.js';
       const wasmUrl = wasmPath ||
         (global.chrome?.runtime?.getURL
           ? chrome.runtime.getURL('assets/lib/ffsubsync_wasm_bg.wasm')
           : 'ffsubsync_wasm_bg.wasm');
 
-      if (typeof importScripts !== 'function') {
-        throw new Error('importScripts unavailable; cannot load ffsubsync-wasm glue in this context');
-      }
-
-      try {
-        importScripts(glueUrl);
-      } catch (e) {
-        throw new Error(`Failed to import ffsubsync glue: ${e?.message || e}`);
-      }
-
-      if (typeof wasm_bindgen !== 'function') {
-        throw new Error('wasm_bindgen not found after loading ffsubsync_wasm.js (build artifacts missing?)');
+      let bindgen = state.bindgen || global.__SubMakerFfsubsyncBindgen || null;
+      if (typeof bindgen !== 'function') {
+        const glueUrl = global.chrome?.runtime?.getURL
+          ? chrome.runtime.getURL('assets/lib/ffsubsync_wasm.js')
+          : 'ffsubsync_wasm.js';
+        if (typeof importScripts !== 'function') {
+          throw new Error('importScripts unavailable; cannot load ffsubsync-wasm glue in this context');
+        }
+        const previous = global.wasm_bindgen;
+        try {
+          importScripts(glueUrl);
+        } catch (e) {
+          throw new Error(`Failed to import ffsubsync glue: ${e?.message || e}`);
+        }
+        bindgen = global.wasm_bindgen;
+        if (typeof bindgen !== 'function') {
+          throw new Error('wasm_bindgen not found after loading ffsubsync_wasm.js (build artifacts missing?)');
+        }
+        state.bindgen = bindgen;
+        global.wasm_bindgen = previous;
       }
 
       const response = await fetch(wasmUrl);
@@ -45,13 +51,16 @@
       }
       const wasmBytes = await response.arrayBuffer();
 
-      const bindgen = await wasm_bindgen(wasmBytes);
-      if (!bindgen || typeof bindgen.align_wav !== 'function') {
+      await bindgen(wasmBytes);
+      if (typeof bindgen.align_wav !== 'function') {
         throw new Error('ffsubsync wasm failed to initialize (align_wav missing)');
       }
       state.api = bindgen;
       return state.api;
-    })();
+    })().catch((e) => {
+      state.loading = null;
+      throw e;
+    });
 
     return state.loading;
   }
@@ -64,20 +73,20 @@
     onProgress?.(20, 'Normalizing audio...');
 
     // Callers are expected to provide 16 kHz mono PCM i16 data or a WAV blob/ArrayBuffer.
-    let wavBuffer;
+    let wavBytes;
     if (audio instanceof ArrayBuffer) {
-      wavBuffer = audio;
+      wavBytes = new Uint8Array(audio);
     } else if (ArrayBuffer.isView(audio)) {
-      wavBuffer = audio.buffer;
+      wavBytes = new Uint8Array(audio.buffer, audio.byteOffset, audio.byteLength);
     } else if (typeof Blob !== 'undefined' && audio instanceof Blob) {
-      wavBuffer = await audio.arrayBuffer();
+      wavBytes = new Uint8Array(await audio.arrayBuffer());
     } else {
       throw new Error('Unsupported audio input for ffsubsync; provide Blob, ArrayBuffer, or TypedArray');
     }
 
     const opts = {
       frame_ms: options.frameMs ?? 10,
-      max_offset_ms: options.maxOffsetMs ?? 60_000,
+      max_offset_ms: options.maxOffsetMs ?? 15 * 60_000,
       gss: !!options.gss,
       sample_rate: options.sampleRate ?? 16_000,
       vad_aggressiveness: options.vadAggressiveness ?? 2,
@@ -86,7 +95,7 @@
     onProgress?.(65, 'Aligning subtitles to audio...');
     let result;
     try {
-      result = api.align_wav(new Uint8Array(wavBuffer), opts, srtText);
+      result = api.align_wav(wavBytes, opts, srtText);
     } catch (e) {
       throw new Error(`ffsubsync alignment failed: ${e?.message || e}`);
     }

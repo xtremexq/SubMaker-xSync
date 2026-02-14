@@ -1626,6 +1626,7 @@ async function decodeAudioWindows(windows, mode, messageId, opts = {}) {
   const sharedBuffer = windows.length > 1 && windows.every(w => w.buffer === windows[0].buffer);
   let sharedInputName = null;
   const audioStreamIndex = Number.isInteger(opts.audioStreamIndex) ? opts.audioStreamIndex : 0;
+  sendOffscreenLog(`Audio decode mapping: 0:a:${audioStreamIndex}`, 'info', messageId);
 
   if (sharedBuffer) {
     sharedInputName = 'shared_input.bin';
@@ -1644,8 +1645,8 @@ async function decodeAudioWindows(windows, mode, messageId, opts = {}) {
         base.push('-map', `0:a:${audioStreamIndex}`);
       }
       base.push('-acodec', 'pcm_s16le', '-ar', '16000');
-      // Avoid mixing bilingual dual-mono tracks; explicitly keep the left channel only.
-      base.push('-af', 'pan=mono|c0=c0', '-ac', '1');
+      // Standard mono downmix is more robust across stereo layouts than forcing left only.
+      base.push('-ac', '1');
       const args = [...base];
       if (typeof win.durSec === 'number' && win.durSec > 0) {
         args.push('-t', String(win.durSec));
@@ -1657,8 +1658,9 @@ async function decodeAudioWindows(windows, mode, messageId, opts = {}) {
       return args;
     };
 
+    const args = buildArgs();
     try {
-      await ffmpeg.run(...buildArgs());
+      await ffmpeg.run(...args);
       const data = ffmpeg.FS('readFile', outputName);
       if (!data?.byteLength) {
         throw new Error(`FFmpeg produced empty audio for window ${i + 1}`);
@@ -1670,6 +1672,11 @@ async function decodeAudioWindows(windows, mode, messageId, opts = {}) {
         audioBytes: data,
         startMs: Math.round(((win.startSec ?? win.seekToSec ?? 0) || 0) * 1000)
       });
+    } catch (err) {
+      const msg = err?.message || String(err);
+      throw new Error(
+        `FFmpeg decode failed at window ${i + 1}/${windows.length} (start=${win?.startSec ?? 'n/a'}s seek=${win?.seekToSec ?? 0}s dur=${win?.durSec ?? 'n/a'}s bytes=${buffer?.byteLength || 0}): ${msg}`
+      );
     } finally {
       try { ffmpeg.FS('unlink', outputName); } catch (_) { /* ignore */ }
       if (!sharedInputName) {

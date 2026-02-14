@@ -1,4 +1,4 @@
-let wasm_bindgen;
+var wasm_bindgen = (typeof self !== 'undefined' && self.wasm_bindgen) ? self.wasm_bindgen : undefined;
 (function() {
     const __exports = {};
     let script_src;

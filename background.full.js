@@ -59,8 +59,10 @@ try {
 }
 
 // Preload alass wrapper + glue at startup to avoid MV3 importScripts restrictions/CSP eval fallbacks.
-let _alassPreloaded = false;
-let _alassPreloadError = null;
+let _alassPreloaded = !!self.SubMakerAlass;
+let _alassPreloadError = self.__xsyncPreloadErrors?.alass || null;
+let _ffsubsyncPreloaded = !!self.SubMakerFfsubsync;
+let _ffsubsyncPreloadError = self.__xsyncPreloadErrors?.ffsubsync || null;
 
 // Lazy WASM loaders
 let _ffmpegInstance = null;
@@ -266,18 +268,8 @@ function normalizeExtractMode(mode) {
 }
 
 // Preload the IDB transfer helper at boot so MV3 doesn't block late importScripts calls.
-let _transferHelperReady = false;
-let _transferHelperError = null;
-try {
-  if (typeof importScripts === 'function') {
-    const preloadUrl = chrome?.runtime?.getURL ? chrome.runtime.getURL('assets/lib/idb-transfer.js') : 'assets/lib/idb-transfer.js';
-    importScripts(preloadUrl);
-    _transferHelperReady = !!self.SubMakerTransfer;
-  }
-} catch (err) {
-  _transferHelperError = err;
-  console.warn('[Background] Failed to preload IDB transfer helper:', err?.message || err);
-}
+let _transferHelperReady = !!self.SubMakerTransfer;
+let _transferHelperError = self.__xsyncPreloadErrors?.transfer || null;
 
 async function safeFetch(url, options = {}) {
   const opts = {
@@ -801,12 +793,30 @@ function alignSubtitlesWithTranscript(subtitleContent, transcriptSegments) {
     }
   }
 
-  // Ensure anchors near start and end
+  // Optional boundary anchors (only when transcript/runtime bounds look compatible).
   if (matches.length >= 2) {
     const first = transcriptSegments[0];
     const last = transcriptSegments[transcriptSegments.length - 1];
-    matches.unshift({ source: subtitles[0].start, target: first.startMs, score: 1 });
-    matches.push({ source: subtitles[subtitles.length - 1].start, target: last.startMs, score: 1 });
+    const subStart = subtitles[0].start || 0;
+    const subEnd = subtitles[subtitles.length - 1].start || subStart;
+    const transcriptStart = first?.startMs || 0;
+    const transcriptEnd = last?.startMs || transcriptStart;
+    const subSpan = Math.max(1, subEnd - subStart);
+    const transcriptSpan = Math.max(1, transcriptEnd - transcriptStart);
+    const spanDeltaRatio = Math.abs(subSpan - transcriptSpan) / Math.max(subSpan, transcriptSpan);
+    const firstMatch = matches[0];
+    const lastMatch = matches[matches.length - 1];
+    const startsReasonablyClose = Math.abs((firstMatch?.source || 0) - subStart) <= 90_000
+      && Math.abs((firstMatch?.target || 0) - transcriptStart) <= 90_000;
+    const endsReasonablyClose = Math.abs((lastMatch?.source || subEnd) - subEnd) <= 180_000
+      && Math.abs((lastMatch?.target || transcriptEnd) - transcriptEnd) <= 180_000;
+
+    if (spanDeltaRatio <= 0.35 && startsReasonablyClose) {
+      matches.unshift({ source: subStart, target: transcriptStart, score: 0.5 });
+    }
+    if (spanDeltaRatio <= 0.35 && endsReasonablyClose) {
+      matches.push({ source: subEnd, target: transcriptEnd, score: 0.5 });
+    }
   }
 
   if (matches.length < 8) {
@@ -1725,7 +1735,15 @@ function __xsyncHandleMessage(message, sender, sendResponse) {
     }
 
     if (message?.type === 'AUTOSUB_SELECT_TRACK') {
-      const ok = resolveAutoSubTrackChoice(message?.messageId, message?.trackIndex);
+      const autoOk = resolveAutoSubTrackChoice(message?.messageId, message?.trackIndex);
+      const syncOk = resolveSyncTrackChoice(message?.messageId, message?.trackIndex);
+      const ok = autoOk || syncOk;
+      reply({ success: ok, resolved: ok });
+      return false;
+    }
+
+    if (message?.type === 'SYNC_SELECT_TRACK') {
+      const ok = resolveSyncTrackChoice(message?.messageId, message?.trackIndex);
       reply({ success: ok, resolved: ok });
       return false;
     }
@@ -1807,6 +1825,8 @@ if (!BOOTSTRAP_MODE) {
  */
 async function handleSyncRequest(message, tabId) {
   const { messageId, streamUrl, subtitleContent, preferAlass, preferFfsubsync, preferCtc, plan: incomingPlan, mode, pageHeaders } = message;
+  const requestedTrackIndex = Number.isInteger(message?.audioTrackIndex) ? message.audioTrackIndex : null;
+  const sourceLanguageHint = normalizeCloudflareLanguageCode(message?.sourceLanguageHint || '') || '';
   const normalizedPlan = normalizeSyncPlan(incomingPlan, mode);
   const normalizedMode = 'single';
   const startedAt = Date.now();
@@ -1821,9 +1841,12 @@ async function handleSyncRequest(message, tabId) {
   }
 
   let lastPct = 0;
+  let lastStatus = '';
+  let lastStatusTs = 0;
   const progressLogger = (pct, status) => {
+    const prev = lastPct;
     const normalized = Math.max(0, Math.min(100, Math.round(Number(pct) || 0)));
-    const clamped = Math.max(lastPct, normalized);
+    const clamped = Math.max(prev, normalized);
     lastPct = clamped;
 
     let statusToSend = status;
@@ -1833,6 +1856,13 @@ async function handleSyncRequest(message, tabId) {
 
     sendProgress(tabId, messageId, clamped, statusToSend);
     if (statusToSend) {
+      const now = Date.now();
+      const changed = statusToSend !== lastStatus;
+      const pctMoved = clamped !== prev;
+      const shouldLog = changed || clamped >= 100 || (pctMoved && (now - lastStatusTs) >= 1200);
+      if (!shouldLog) return;
+      lastStatus = statusToSend;
+      lastStatusTs = now;
       sendDebugLog(tabId, messageId, statusToSend, 'info');
     }
   };
@@ -1846,12 +1876,58 @@ async function handleSyncRequest(message, tabId) {
   try { await incStat('activeSyncs', 1); } catch (_) { }
 
   try {
+    let selectedAudioTrackIndex = requestedTrackIndex;
+    try {
+      const audioTracks = await probeAudioTracksFromStream(streamUrl, pageHeaders, syncCtx);
+      if (audioTracks.length) {
+        const trackSummaries = audioTracks.map(t => `#${t.trackNumber || t.index + 1}${t.language ? `(${t.language})` : ''}${t.name ? ` ${t.name}` : ''}`).join(' | ');
+        sendDebugLog(tabId, messageId, `Detected audio tracks: ${trackSummaries}`, 'info');
+      }
+      const { preferred, ordered } = pickPreferredAudioTrack(audioTracks, sourceLanguageHint || 'en');
+      if (!Number.isInteger(selectedAudioTrackIndex) && ordered && ordered.length > 1) {
+        const defaultIdx = preferred && Number.isInteger(preferred.index)
+          ? preferred.index
+          : (ordered[0]?.index ?? 0);
+        sendSyncTrackOptions(tabId, messageId, ordered, defaultIdx, defaultIdx);
+        progressLogger(6, 'Multiple audio tracks detected. Choose one to continue.');
+        const choice = await awaitSyncTrackChoice(messageId, defaultIdx, ordered);
+        selectedAudioTrackIndex = Number.isInteger(choice) && choice >= 0 ? choice : defaultIdx;
+      }
+      if (!Number.isInteger(selectedAudioTrackIndex)) {
+        if (preferred && Number.isInteger(preferred.index)) {
+          selectedAudioTrackIndex = preferred.index;
+        } else if (audioTracks.length && Number.isInteger(audioTracks[0]?.index)) {
+          selectedAudioTrackIndex = audioTracks[0].index;
+        }
+      }
+      if (Number.isInteger(selectedAudioTrackIndex) && selectedAudioTrackIndex >= 0) {
+        const trackLang = resolveTrackLanguageByIndex(audioTracks, selectedAudioTrackIndex, normalizeCloudflareLanguageCode);
+        const trackMeta = Array.isArray(audioTracks)
+          ? (audioTracks.find(t => Number.isInteger(t?.index) && t.index === selectedAudioTrackIndex) || null)
+          : null;
+        const displayTrack = trackMeta?.trackNumber || (selectedAudioTrackIndex + 1);
+        const trackLabel = `stream ${selectedAudioTrackIndex + 1} (container #${displayTrack})`;
+        const details = trackLang ? ` (lang=${trackLang})` : '';
+        sendDebugLog(tabId, messageId, `Using audio track ${trackLabel}${details}`, 'info');
+      }
+    } catch (trackProbeErr) {
+      sendDebugLog(tabId, messageId, `Audio track probe unavailable: ${trackProbeErr?.message || trackProbeErr}`, 'warn');
+    }
+
     // Step 1: Extract audio from stream
     progressLogger(8, `Fetching video (${normalizedMode})...`);
+    let lastExtractLoggedPct = -1;
     const audioWindows = await extractAudioFromStream(streamUrl, normalizedPlan, (progress) => {
       const pct = 8 + (progress * 0.42);
-      progressLogger(pct, `Extracting audio: ${Math.round(progress)}%`);
-    }, syncCtx);
+      const roundedProgress = Math.max(0, Math.min(100, Math.round(Number(progress) || 0)));
+      const status = roundedProgress !== lastExtractLoggedPct ? `Extracting audio: ${roundedProgress}%` : undefined;
+      if (status) {
+        lastExtractLoggedPct = roundedProgress;
+      }
+      progressLogger(pct, status);
+    }, syncCtx, {
+      audioStreamIndex: Number.isInteger(selectedAudioTrackIndex) && selectedAudioTrackIndex >= 0 ? selectedAudioTrackIndex : undefined
+    });
     const windowMeta = (audioWindows || []).map((w, idx) => ({
       idx: idx + 1,
       startMs: Math.round(w?.startMs || 0),
@@ -1871,7 +1947,7 @@ async function handleSyncRequest(message, tabId) {
 
     let workingSubtitle = subtitleContent;
 
-    const prepassEnabled = normalizedPlan.useFingerprintPrepass !== false && !preferFfsubsync;
+    const prepassEnabled = normalizedPlan.useFingerprintPrepass !== false && !preferFfsubsync && !preferAlass;
     if (prepassEnabled) {
       const prepass = await runFingerprintPrepass(audioWindows, workingSubtitle, normalizedPlan, syncCtx, progressLogger);
       if (prepass?.applied && prepass.subtitleContent) {
@@ -1879,6 +1955,8 @@ async function handleSyncRequest(message, tabId) {
       }
     } else if (preferFfsubsync) {
       sendDebugLog(tabId, messageId, 'Skipping fingerprint pre-pass (ffsubsync already primary)', 'info');
+    } else if (preferAlass) {
+      sendDebugLog(tabId, messageId, 'Skipping fingerprint pre-pass (ALASS preferred)', 'info');
     } else {
       sendDebugLog(tabId, messageId, 'Fingerprint pre-pass disabled by user', 'info');
     }
@@ -1893,6 +1971,58 @@ async function handleSyncRequest(message, tabId) {
       const pct = syncStart + (clamped * (syncSpan / 100));
       progressLogger(pct, status || `Syncing: ${Math.round(clamped)}%`);
     }, preferAlass === true, syncCtx, { preferFfsubsync: preferFfsubsync === true, preferCtc: preferCtc === true, ffsubsyncOptions: message.ffsubsyncOptions || {} });
+
+    let safeSubtitle = syncedSubtitle;
+    let safety = evaluateSubtitleSafety(subtitleContent, safeSubtitle, normalizedPlan);
+    if (!safety.ok && (preferFfsubsync === true || preferAlass === true)) {
+      const retryWithAlass = preferFfsubsync === true;
+      const retryWithFfsubsync = preferAlass === true;
+      const retryLabel = retryWithAlass ? 'ALASS' : 'FFSUBSYNC';
+      sendDebugLog(tabId, messageId, `Primary ${preferFfsubsync ? 'ffsubsync' : 'alass'} result failed safety (${safety.reason || 'unknown reason'}). Retrying with ${retryLabel}...`, 'warn');
+      try {
+        const retriedSubtitle = await synchronizeSubtitle(audioWindows, workingSubtitle, normalizedMode, (progress, status) => {
+          const clamped = Math.max(0, Math.min(100, progress || 0));
+          const pct = syncStart + (clamped * (syncSpan / 100));
+          progressLogger(pct, status || `Retry sync (${retryLabel}): ${Math.round(clamped)}%`);
+        }, retryWithAlass, syncCtx, {
+          preferFfsubsync: retryWithFfsubsync,
+          preferCtc: false,
+          ffsubsyncOptions: message.ffsubsyncOptions || {}
+        });
+        const retrySafety = evaluateSubtitleSafety(subtitleContent, retriedSubtitle, normalizedPlan);
+        if (retrySafety.ok) {
+          sendDebugLog(tabId, messageId, `${retryLabel} retry passed safety checks and will be used.`, 'info');
+          safeSubtitle = retriedSubtitle;
+          safety = retrySafety;
+        } else {
+          sendDebugLog(tabId, messageId, `${retryLabel} retry also failed safety (${retrySafety.reason || 'unknown reason'}).`, 'warn');
+        }
+      } catch (retryErr) {
+        sendDebugLog(tabId, messageId, `${retryLabel} retry failed: ${retryErr?.message || retryErr}`, 'warn');
+      }
+    }
+    if (!safety.ok) {
+      const reason = safety.reason || 'unknown reason';
+      sendDebugLog(tabId, messageId, `Sync safety guard rejected transformed subtitle: ${reason}. Returning original subtitle.`, 'warn');
+      progressLogger(100, 'Sync finished with safety fallback');
+      activeSyncJobs.delete(messageId);
+      try {
+        await incStat('totalSynced', 1);
+        await incStat('activeSyncs', -1);
+      } catch (_) { }
+      return {
+        success: true,
+        syncedSubtitle: subtitleContent
+      };
+    }
+    if (safety?.stats) {
+      sendDebugLog(
+        tabId,
+        messageId,
+        `Sync safety stats: medianShift=${Math.round(safety.stats.medianAbsShiftMs)}ms p95Shift=${Math.round(safety.stats.p95AbsShiftMs)}ms durationRatio=${safety.stats.medianDurRatio.toFixed(2)} cues=${safety.stats.candidateCount}/${safety.stats.originalCount}`,
+        'info'
+      );
+    }
 
     progressLogger(100, 'Sync complete!');
 
@@ -1910,7 +2040,7 @@ async function handleSyncRequest(message, tabId) {
 
     return {
       success: true,
-      syncedSubtitle: syncedSubtitle
+      syncedSubtitle: safeSubtitle
     };
 
   } catch (error) {
@@ -2034,11 +2164,12 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
   try {
     const isHls = /\.m3u8(\?|$)/i.test(streamUrl);
     const isDash = /\.mpd(\?|$)/i.test(streamUrl);
-    const wantsFullStream = normalizedPlan.fullScan === true || normalizedPlan.coveragePct >= 0.99 || normalizedPlan.preset === 'complete';
+    const wantsFullStream = normalizedPlan.fullScan === true || normalizedPlan.coverageTargetPct >= 0.99 || normalizedPlan.preset === 'complete';
     if (ctx?.tabId) {
       sendDebugLog(ctx.tabId, ctx.messageId, `Stream type detection: HLS=${isHls} DASH=${isDash}`, 'info');
     }
-    let detectedDuration = Number.isFinite(normalizedPlan.durationSeconds) ? normalizedPlan.durationSeconds : null;
+    const durationHintSec = Number.isFinite(normalizedPlan.durationSeconds) ? normalizedPlan.durationSeconds : null;
+    let detectedDuration = null;
     let audioWindows = [];
 
     if (isDash && !detectedDuration) {
@@ -2186,10 +2317,10 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
       return null;
     };
 
-    let sampleCoverageSec = estimateCoverageSec(sample, detectedDuration || sample?.durationSec);
+    let sampleCoverageSec = estimateCoverageSec(sample, detectedDuration || sample?.durationSec || durationHintSec);
 
     const computePlanAndWindows = (durationSec) => planWindows(durationSec, normalizeSyncPlan({ ...normalizedPlan, durationSeconds: durationSec }));
-    const durationForPlan = detectedDuration || sample?.durationSec || planInput?.durationSeconds || sampleCoverageSec;
+    const durationForPlan = detectedDuration || sample?.durationSec || sampleCoverageSec || durationHintSec;
     let { windows: windowSpecs, plan: effectivePlan } = computePlanAndWindows(durationForPlan);
     if (effectivePlan) {
       onProgress(18, `Sync plan: ${describePlanForLog(effectivePlan)}`);
@@ -2204,7 +2335,8 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
     const buildWindowBuffers = async (specs, headSample, totalDurationSec, headCoverageSec = null) => {
       const windows = [];
       const fallbackHead = (specs?.[0]?.durSec || effectivePlan?.windowSeconds || 60);
-      const headDuration = headCoverageSec
+      const coverageHint = headSample?.partial ? headCoverageSec : null;
+      const headDuration = coverageHint
         || headSample?.durationSec
         || probeContainerDuration(headSample?.buffer)
         || totalDurationSec
@@ -2269,6 +2401,20 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
           }
         }
       }
+      if (headSample?.partial && windows.length > 1) {
+        const seen = new Set();
+        let unique = 0;
+        for (const w of windows) {
+          const key = `${w.buffer === headSample?.buffer ? 'head' : 'tail'}:${Math.round((w.startSec || 0) * 10) / 10}:${Math.round((w.seekToSec || 0) * 10) / 10}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            unique += 1;
+          }
+        }
+        if (unique < windows.length) {
+          throw new Error(`Partial sample produced overlapping decode windows (${unique}/${windows.length} distinct); full fetch required`);
+        }
+      }
       return windows;
     };
 
@@ -2277,7 +2423,8 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
       if (ctx?.tabId) {
         sendDebugLog(ctx.tabId, ctx.messageId, `Preparing window buffers (partial=${sampleData?.partial === true})`, 'info');
       }
-      const windows = await buildWindowBuffers(windowSpecs, sampleData, durationForPlan, sampleCoverageSec);
+      const coverageHint = sampleData?.partial ? sampleCoverageSec : null;
+      const windows = await buildWindowBuffers(windowSpecs, sampleData, durationForPlan, coverageHint);
       return await decodeWindowsWithFFmpeg(
         windows,
         normalizedMode,
@@ -2323,7 +2470,7 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
         if (sample?.durationSec && !detectedDuration) {
           detectedDuration = sample.durationSec;
         }
-        const durationForRetry = detectedDuration || sample?.durationSec || planInput?.durationSeconds || null;
+        const durationForRetry = detectedDuration || sample?.durationSec || sampleCoverageSec || durationHintSec || null;
         ({ windows: windowSpecs, plan: effectivePlan } = computePlanAndWindows(durationForRetry || durationForPlan));
         if (effectivePlan && ctx?.tabId) {
           sendDebugLog(ctx.tabId, ctx.messageId, `Retry decode after full fetch; window specs (${windowSpecs.length}): ${JSON.stringify(windowSpecs)}`, 'info');
@@ -3973,53 +4120,169 @@ async function runFfsubsyncSync(audioData, subtitleContent, onProgress, ctx = nu
     throw new Error('ffsubsync-wasm unavailable');
   }
 
-  // Pick the first audio window; future work: combine multiple windows if needed.
-  const firstWindow = Array.isArray(audioData) ? audioData.find(w => w?.audioBlob) : null;
-  const audioBlob = (firstWindow && firstWindow.audioBlob) || (audioData && audioData.audioBlob) || audioData;
-  if (!audioBlob || typeof audioBlob.arrayBuffer !== 'function') {
+  const windows = Array.isArray(audioData)
+    ? audioData.filter(w => w?.audioBlob && typeof w.audioBlob.arrayBuffer === 'function')
+    : ((audioData && audioData.audioBlob && typeof audioData.audioBlob.arrayBuffer === 'function')
+      ? [audioData]
+      : (audioData && typeof audioData.arrayBuffer === 'function')
+        ? [{ audioBlob: audioData, startMs: 0 }]
+        : []);
+  if (!windows.length) {
     throw new Error('Invalid audio data for ffsubsync');
   }
 
-  onProgress?.(32, 'Preparing audio for ffsubsync...');
-  const wavBuffer = await audioBlob.arrayBuffer();
-
   const alignOptions = {
     frameMs: options.frameMs ?? 10,
-    maxOffsetMs: options.maxOffsetMs ?? 60_000,
+    maxOffsetMs: options.maxOffsetMs ?? 15 * 60_000,
     vadAggressiveness: options.vadAggressiveness ?? 2,
     gss: options.gss ?? false,
     sampleRate: options.sampleRate ?? 16_000
   };
 
-  onProgress?.(64, 'Aligning subtitles to audio (ffsubsync)...');
-  let result;
-  try {
-    result = await ffsubsync.align({
+  const runOneWindow = async (windowObj, idx, total) => {
+    const startMs = Number.isFinite(windowObj?.startMs) ? Math.max(0, Math.round(windowObj.startMs)) : 0;
+    onProgress?.(
+      Math.min(88, 28 + Math.round(((idx + 1) / Math.max(1, total)) * 55)),
+      `Aligning window ${idx + 1}/${total} with ffsubsync...`
+    );
+    const wavBuffer = await windowObj.audioBlob.arrayBuffer();
+    const oneResult = await ffsubsync.align({
       audio: wavBuffer,
       srtText: subtitleContent,
       options: alignOptions,
-      onProgress: (p, s) => onProgress?.(Math.min(90, p), s || 'ffsubsync alignment running...')
+      onProgress: (p, s) => {
+        const clamped = Math.max(0, Math.min(100, p || 0));
+        const base = 30 + (idx / Math.max(1, total)) * 50;
+        const span = 50 / Math.max(1, total);
+        onProgress?.(Math.min(90, Math.round(base + (clamped * span / 100))), s || `ffsubsync running on window ${idx + 1}/${total}...`);
+      }
     });
-  } catch (err) {
-    const msg = err?.message || String(err);
-    logToPage(`ffsubsync alignment failed: ${msg}`, 'error');
-    throw new Error(`ffsubsync alignment failed: ${msg}`);
+    if (!oneResult || (!oneResult.srt && !Number.isFinite(oneResult.offsetMs) && !Number.isFinite(oneResult.offset_ms))) {
+      throw new Error('ffsubsync returned empty result');
+    }
+    const localOffset = Number(oneResult.offsetMs ?? oneResult.offset_ms ?? 0) || 0;
+    const inferredOffset = typeof oneResult.srt === 'string'
+      ? estimateSrtOffsetMs(subtitleContent, oneResult.srt)
+      : null;
+    const globalOffset = Number.isFinite(inferredOffset) ? inferredOffset : localOffset;
+    const confidence = Number(oneResult.confidence ?? 0) || 0;
+    const anchorsRaw = oneResult.segments ?? oneResult.segments_used ?? null;
+    const anchors = Array.isArray(anchorsRaw)
+      ? anchorsRaw.length
+      : (Number.isFinite(anchorsRaw) ? Number(anchorsRaw) : 0);
+    const drift = Number(oneResult.drift ?? 1) || 1;
+    logToPage(
+      `ffsubsync window ${idx + 1}/${total}: start=${startMs}ms local=${Math.round(localOffset)}ms inferred=${Number.isFinite(inferredOffset) ? Math.round(inferredOffset) : 'n/a'}ms global=${Math.round(globalOffset)}ms confidence=${confidence.toFixed(3)} anchors=${anchors}`,
+      'info'
+    );
+    return {
+      raw: oneResult,
+      startMs,
+      localOffset,
+      inferredOffset,
+      globalOffset,
+      confidence,
+      anchors,
+      drift
+    };
+  };
+
+  onProgress?.(24, `Preparing ${windows.length} audio window(s) for ffsubsync...`);
+  const outcomes = [];
+  const errors = [];
+  for (let i = 0; i < windows.length; i++) {
+    try {
+      outcomes.push(await runOneWindow(windows[i], i, windows.length));
+    } catch (err) {
+      errors.push(err?.message || String(err));
+      logToPage(`ffsubsync window ${i + 1}/${windows.length} failed: ${err?.message || err}`, 'warn');
+    }
+  }
+  if (!outcomes.length) {
+    const detail = errors.length ? ` (${errors.join(' | ')})` : '';
+    throw new Error(`ffsubsync alignment failed for all windows${detail}`);
   }
 
-  if (!result || !result.srt) {
-    throw new Error('ffsubsync returned empty result');
+  const sortedOffsets = outcomes.map(o => o.globalOffset).sort((a, b) => a - b);
+  const medianOffset = sortedOffsets[Math.floor(sortedOffsets.length / 2)];
+  const absDev = outcomes.map(o => Math.abs(o.globalOffset - medianOffset)).sort((a, b) => a - b);
+  const mad = absDev[Math.floor(absDev.length / 2)] || 0;
+  const inlierBand = Math.max(500, mad * 3);
+  const inliers = outcomes.filter(o => Math.abs(o.globalOffset - medianOffset) <= inlierBand);
+  const pool = inliers.length ? inliers : outcomes;
+  const picked = pool.reduce((best, cur) => {
+    if (!best) return cur;
+    if ((cur.confidence || 0) > (best.confidence || 0)) return cur;
+    if ((cur.confidence || 0) === (best.confidence || 0) && (cur.anchors || 0) > (best.anchors || 0)) return cur;
+    return best;
+  }, null);
+
+  let chosenOffset = Math.round(picked?.globalOffset || 0);
+  const chosenConfidence = Number(picked?.confidence || 0);
+  const chosenAnchors = Number(picked?.anchors || 0);
+  const minApplyOffsetMs = Number.isFinite(options.minApplyOffsetMs) ? Math.max(0, options.minApplyOffsetMs) : 120;
+  const lowConfidenceLargeShift = chosenConfidence < 0.18 && chosenAnchors < 8 && Math.abs(chosenOffset) > 2000;
+  if (Math.abs(chosenOffset) < minApplyOffsetMs || lowConfidenceLargeShift) {
+    const reason = lowConfidenceLargeShift
+      ? `low-confidence large shift (${chosenOffset}ms @ conf=${chosenConfidence.toFixed(3)})`
+      : `tiny shift (${chosenOffset}ms)`;
+    logToPage(`ffsubsync safety guard: skipping offset due to ${reason}`, 'warn');
+    chosenOffset = 0;
   }
+
+  const inferredVsChosenGap = Number.isFinite(picked?.inferredOffset)
+    ? Math.abs((picked?.inferredOffset || 0) - chosenOffset)
+    : Number.POSITIVE_INFINITY;
+  const canTrustDirectSrt = !!picked?.raw?.srt && inferredVsChosenGap <= 750;
+  const finalSrt = canTrustDirectSrt && picked?.raw?.srt
+    ? String(picked.raw.srt).trim()
+    : offsetSubtitles(subtitleContent, chosenOffset);
 
   onProgress?.(95, 'ffsubsync alignment succeeded');
-  logToPage(`ffsubsync alignment succeeded (offset ${result.offsetMs ?? 'n/a'}ms)`, 'info');
+  logToPage(
+    `ffsubsync alignment selected offset ${chosenOffset}ms (${pool.length}/${outcomes.length} inliers, confidence=${chosenConfidence.toFixed(3)})`,
+    'info'
+  );
   return {
-    result: result.srt.trim(),
+    result: finalSrt,
     method: 'ffsubsync',
-    offsetMs: result.offsetMs ?? result.offset_ms ?? 0,
-    drift: result.drift ?? 1,
-    confidence: result.confidence ?? 0,
-    anchors: result.segments ?? result.segments_used ?? null
+    offsetMs: chosenOffset,
+    drift: picked?.drift ?? 1,
+    confidence: chosenConfidence,
+    anchors: picked?.anchors ?? 0
   };
+}
+
+function pickRepresentativeAudioWindows(windows, desired = 3) {
+  const list = Array.isArray(windows) ? windows.filter(w => w?.audioBlob) : [];
+  if (!list.length) return [];
+  if (list.length <= desired) return list;
+
+  const sorted = [...list].sort((a, b) => (a?.startMs || 0) - (b?.startMs || 0));
+  const picks = [];
+  const usedStarts = new Set();
+  for (let i = 0; i < desired; i++) {
+    const pos = desired === 1 ? 0 : i / (desired - 1);
+    const idx = Math.min(sorted.length - 1, Math.max(0, Math.round(pos * (sorted.length - 1))));
+    const win = sorted[idx];
+    const key = Math.round((win?.startMs || 0) / 1000);
+    if (!usedStarts.has(key)) {
+      picks.push(win);
+      usedStarts.add(key);
+    }
+  }
+
+  if (picks.length < desired) {
+    for (const win of sorted) {
+      if (picks.length >= desired) break;
+      const key = Math.round((win?.startMs || 0) / 1000);
+      if (!usedStarts.has(key)) {
+        picks.push(win);
+        usedStarts.add(key);
+      }
+    }
+  }
+  return picks;
 }
 
 async function runFingerprintPrepass(audioWindows, subtitleContent, plan, ctx, progressLogger) {
@@ -4032,12 +4295,13 @@ async function runFingerprintPrepass(audioWindows, subtitleContent, plan, ctx, p
     return { subtitleContent, applied: false };
   }
 
-  const sampleWindows = windows.slice(0, 3);
+  const sampleWindows = pickRepresentativeAudioWindows(windows, 3);
   try {
     const prepassStart = 54;
     const prepassSpan = 5;
     progressLogger?.(prepassStart, 'Fingerprint pre-pass: coarse ffsubsync offset...');
-    logToPage(`Fingerprint pre-pass running on ${sampleWindows.length} window(s)...`, 'info');
+    const sampleRange = sampleWindows.map(w => Math.round((w?.startMs || 0) / 1000)).join(',');
+    logToPage(`Fingerprint pre-pass running on ${sampleWindows.length} representative window(s) [${sampleRange}]...`, 'info');
     const coarse = await runFfsubsyncSync(sampleWindows, subtitleContent, (p, status) => {
       const clamped = Math.max(0, Math.min(100, p || 0));
       const pct = prepassStart + (clamped * (prepassSpan / 100));
@@ -4045,15 +4309,25 @@ async function runFingerprintPrepass(audioWindows, subtitleContent, plan, ctx, p
     }, ctx, { frameMs: 20, maxOffsetMs: 15 * 60 * 1000, vadAggressiveness: 3, gss: true });
 
     const offsetMs = Number.isFinite(coarse?.offsetMs) ? Math.round(coarse.offsetMs) : 0;
-    if (offsetMs) {
+    const confidence = Number(coarse?.confidence ?? 0) || 0;
+    const anchors = Number(coarse?.anchors ?? 0) || 0;
+    const absOffset = Math.abs(offsetMs);
+    const maxSafeOffsetMs = 45 * 1000;
+    const allowLargeOffset = absOffset <= 10 * 1000 || (confidence >= 0.65 && anchors >= 2);
+    if (offsetMs && absOffset <= maxSafeOffsetMs && allowLargeOffset) {
       const adjusted = offsetSubtitles(subtitleContent, offsetMs);
       const label = plan?.modeGroup || plan?.preset || 'autosync';
-      logToPage(`Fingerprint pre-pass applied coarse offset ${offsetMs}ms before ${label}`, 'info');
+      logToPage(`Fingerprint pre-pass applied coarse offset ${offsetMs}ms before ${label} (confidence=${confidence.toFixed(3)}, anchors=${anchors})`, 'info');
       progressLogger?.(prepassStart + prepassSpan, `Fingerprint pre-pass applied ${offsetMs}ms`);
       return { subtitleContent: adjusted, offsetMs, applied: true, method: 'ffsubsync' };
     }
-
-    logToPage('Fingerprint pre-pass completed (no offset change)', 'info');
+    if (offsetMs && !allowLargeOffset) {
+      logToPage(`Fingerprint pre-pass skipped coarse offset ${offsetMs}ms (confidence=${confidence.toFixed(3)}, anchors=${anchors})`, 'warn');
+    } else if (offsetMs && absOffset > maxSafeOffsetMs) {
+      logToPage(`Fingerprint pre-pass skipped unsafe coarse offset ${offsetMs}ms`, 'warn');
+    } else {
+      logToPage('Fingerprint pre-pass completed (no offset change)', 'info');
+    }
     return { subtitleContent, offsetMs: 0, applied: false, method: 'ffsubsync' };
   } catch (err) {
     logToPage(`Fingerprint pre-pass skipped: ${err?.message || err}`, 'warn');
@@ -4443,12 +4717,13 @@ function estimateSubtitleDurationSec(subtitleContent) {
 
 function summarizeAudioWindowCoverage(windows, diagnostics = []) {
   if (!Array.isArray(windows) || !windows.length) {
-    return { count: 0, spanMs: 0, minStartMs: 0, maxEndMs: 0, totalDurationMs: 0 };
+    return { count: 0, spanMs: 0, minStartMs: 0, maxEndMs: 0, totalDurationMs: 0, coveredMs: 0 };
   }
 
   let minStart = Number.POSITIVE_INFINITY;
   let maxEnd = 0;
   let totalDurationMs = 0;
+  const intervals = [];
 
   for (let i = 0; i < windows.length; i++) {
     const startMs = Math.max(0, Math.round(windows[i]?.startMs ?? (windows[i]?.startSec || 0) * 1000));
@@ -4457,8 +4732,10 @@ function summarizeAudioWindowCoverage(windows, diagnostics = []) {
       : null;
     minStart = Math.min(minStart, startMs);
     if (Number.isFinite(durMs)) {
-      maxEnd = Math.max(maxEnd, startMs + durMs);
+      const endMs = startMs + durMs;
+      maxEnd = Math.max(maxEnd, endMs);
       totalDurationMs += durMs;
+      intervals.push([startMs, endMs]);
     } else {
       maxEnd = Math.max(maxEnd, startMs);
     }
@@ -4466,7 +4743,26 @@ function summarizeAudioWindowCoverage(windows, diagnostics = []) {
 
   if (!Number.isFinite(minStart)) minStart = 0;
   const spanMs = Math.max(0, maxEnd - minStart);
-  return { count: windows.length, spanMs, minStartMs: minStart, maxEndMs: maxEnd, totalDurationMs };
+
+  let coveredMs = 0;
+  if (intervals.length) {
+    intervals.sort((a, b) => a[0] - b[0]);
+    let curStart = intervals[0][0];
+    let curEnd = intervals[0][1];
+    for (let i = 1; i < intervals.length; i++) {
+      const [s, e] = intervals[i];
+      if (s <= curEnd) {
+        curEnd = Math.max(curEnd, e);
+      } else {
+        coveredMs += Math.max(0, curEnd - curStart);
+        curStart = s;
+        curEnd = e;
+      }
+    }
+    coveredMs += Math.max(0, curEnd - curStart);
+  }
+
+  return { count: windows.length, spanMs, minStartMs: minStart, maxEndMs: maxEnd, totalDurationMs, coveredMs };
 }
 
 function ensureAlassCoverageSufficient(usableWindows, diagnostics, ctx, subtitleContent) {
@@ -4476,9 +4772,11 @@ function ensureAlassCoverageSufficient(usableWindows, diagnostics, ctx, subtitle
 
   const coverage = summarizeAudioWindowCoverage(usableWindows, diagnostics);
   const spanSec = coverage.spanMs / 1000;
+  const coveredSec = (coverage.coveredMs || 0) / 1000;
   const estimatedDurationSec = expectedDurationSec || null;
   const plannedWindows = Number.isFinite(plan.windowCount) ? plan.windowCount : plan.minWindows;
   const coverageRatio = estimatedDurationSec ? (spanSec / estimatedDurationSec) : null;
+  const coveredRatio = estimatedDurationSec ? (coveredSec / estimatedDurationSec) : null;
   const plannedCoverageRatio = (() => {
     if (!estimatedDurationSec) return null;
     if (Number.isFinite(plan.coverageSeconds)) return plan.coverageSeconds / estimatedDurationSec;
@@ -4487,15 +4785,15 @@ function ensureAlassCoverageSufficient(usableWindows, diagnostics, ctx, subtitle
   })();
 
   if (ctx?.tabId) {
-    const label = `alass coverage: span ~${Math.round(spanSec)}s, windows=${coverage.count}${plannedWindows ? `/${plannedWindows}` : ''}${estimatedDurationSec ? `, expected ~${Math.round(estimatedDurationSec)}s` : ''}${coverageRatio ? ` (~${Math.round(coverageRatio * 100)}% of expected)` : ''}${plannedCoverageRatio ? `, plan target ~${Math.round(plannedCoverageRatio * 100)}%` : ''}`;
+    const label = `alass coverage: span ~${Math.round(spanSec)}s, covered ~${Math.round(coveredSec)}s, windows=${coverage.count}${plannedWindows ? `/${plannedWindows}` : ''}${estimatedDurationSec ? `, expected ~${Math.round(estimatedDurationSec)}s` : ''}${coverageRatio ? `, span~${Math.round(coverageRatio * 100)}%` : ''}${coveredRatio ? `, covered~${Math.round(coveredRatio * 100)}%` : ''}${plannedCoverageRatio ? `, plan target ~${Math.round(plannedCoverageRatio * 100)}%` : ''}`;
     sendDebugLog(ctx.tabId, ctx.messageId, label, 'info');
   }
-  console.log('[Background] alass coverage summary:', { spanSec, count: coverage.count, expectedDurationSec });
+  console.log('[Background] alass coverage summary:', { spanSec, coveredSec, count: coverage.count, expectedDurationSec });
 
   if (!estimatedDurationSec) return; // Skip strict coverage checks for unknown durations
 
   const targetRatio = plannedCoverageRatio || 0.1;
-  const coverageRatioStrict = spanSec / estimatedDurationSec;
+  const coverageRatioStrict = coveredSec / estimatedDurationSec;
   const minWindowsNeeded = Math.max(2, plannedWindows || plan.minWindows || 3);
   if (coverage.count < minWindowsNeeded) {
     throw new Error(`Insufficient audio windows for alass (${coverage.count}/${minWindowsNeeded})`);
@@ -5067,6 +5365,127 @@ function offsetSubtitles(srtContent, offsetMs) {
   return result.trim();
 }
 
+function percentileFromSorted(sorted, q) {
+  if (!Array.isArray(sorted) || !sorted.length) return 0;
+  const clampedQ = Math.max(0, Math.min(1, q));
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor(clampedQ * (sorted.length - 1))));
+  return sorted[idx] || 0;
+}
+
+function estimateSrtOffsetMs(baseSrt, candidateSrt) {
+  const base = parseSRT(baseSrt || '');
+  const candidate = parseSRT(candidateSrt || '');
+  if (!base.length || !candidate.length) return null;
+  const pairCount = Math.min(base.length, candidate.length);
+  if (pairCount < 5) return null;
+  const deltas = [];
+  for (let i = 0; i < pairCount; i++) {
+    const b = base[i];
+    const c = candidate[i];
+    if (!b || !c) continue;
+    deltas.push((c.start || 0) - (b.start || 0));
+  }
+  if (deltas.length < 5) return null;
+  deltas.sort((a, b) => a - b);
+  return Math.round(percentileFromSorted(deltas, 0.5));
+}
+
+function evaluateSubtitleSafety(originalSrt, candidateSrt, plan = null) {
+  const original = parseSRT(originalSrt || '');
+  const candidate = parseSRT(candidateSrt || '');
+
+  if (!candidate.length) {
+    return { ok: false, reason: 'candidate subtitle is empty' };
+  }
+  if (!original.length) {
+    return { ok: true, reason: 'no original cues to compare' };
+  }
+
+  const originalCount = original.length;
+  const candidateCount = candidate.length;
+  const countRatio = candidateCount / Math.max(1, originalCount);
+  if (countRatio < 0.8 || countRatio > 1.25) {
+    return { ok: false, reason: `cue count drifted too much (${candidateCount}/${originalCount})` };
+  }
+
+  let nonMonotonic = false;
+  for (let i = 1; i < candidate.length; i++) {
+    if ((candidate[i]?.start || 0) + 5 < (candidate[i - 1]?.start || 0)) {
+      nonMonotonic = true;
+      break;
+    }
+  }
+  if (nonMonotonic) {
+    return { ok: false, reason: 'candidate cue timeline is non-monotonic' };
+  }
+
+  const pairCount = Math.min(original.length, candidate.length);
+  const absShifts = [];
+  const signedShifts = [];
+  const durationRatios = [];
+  let clampedAtZeroCount = 0;
+  for (let i = 0; i < pairCount; i++) {
+    const o = original[i];
+    const c = candidate[i];
+    if (!o || !c) continue;
+    const signedShift = (c.start || 0) - (o.start || 0);
+    signedShifts.push(signedShift);
+    absShifts.push(Math.abs(signedShift));
+    if ((c.start || 0) <= 1 && (o.start || 0) > 1500) {
+      clampedAtZeroCount += 1;
+    }
+    const oDur = Math.max(1, (o.end || 0) - (o.start || 0));
+    const cDur = Math.max(1, (c.end || 0) - (c.start || 0));
+    durationRatios.push(cDur / oDur);
+  }
+  if (!absShifts.length) {
+    return { ok: false, reason: 'unable to compute shift stats' };
+  }
+
+  const sortedShifts = absShifts.slice().sort((a, b) => a - b);
+  const medianAbsShiftMs = percentileFromSorted(sortedShifts, 0.5);
+  const p95AbsShiftMs = percentileFromSorted(sortedShifts, 0.95);
+  const sortedSignedShifts = signedShifts.slice().sort((a, b) => a - b);
+  const p05SignedShiftMs = percentileFromSorted(sortedSignedShifts, 0.05);
+  const p95SignedShiftMs = percentileFromSorted(sortedSignedShifts, 0.95);
+  const signedShiftSpreadMs = p95SignedShiftMs - p05SignedShiftMs;
+
+  const sortedDurRatios = durationRatios.slice().sort((a, b) => a - b);
+  const medianDurRatio = percentileFromSorted(sortedDurRatios, 0.5);
+
+  // Hard safety rails: prevent catastrophic rewrites.
+  if (!Number.isFinite(medianDurRatio) || medianDurRatio < 0.3 || medianDurRatio > 3.5) {
+    return { ok: false, reason: `duration profile implausible (median ratio ${medianDurRatio.toFixed(2)})` };
+  }
+  if (p95AbsShiftMs > 20 * 60 * 1000) {
+    return { ok: false, reason: `extreme shift detected (p95=${Math.round(p95AbsShiftMs)}ms)` };
+  }
+  if (clampedAtZeroCount >= 5 && (clampedAtZeroCount / Math.max(1, pairCount)) > 0.01) {
+    return { ok: false, reason: `candidate appears clamped to timeline start (${clampedAtZeroCount}/${pairCount} cues at 00:00:00)` };
+  }
+  if (signedShiftSpreadMs > 90 * 1000 && medianAbsShiftMs > 45 * 1000) {
+    return { ok: false, reason: `non-uniform shift warp detected (spread=${Math.round(signedShiftSpreadMs)}ms)` };
+  }
+
+  // Extra strictness for complete/full scans where large bad shifts were reported.
+  const isFullScan = plan?.fullScan === true || Number(plan?.coverageTargetPct || 0) >= 0.99;
+  if (isFullScan && medianAbsShiftMs > 3 * 60 * 1000) {
+    return { ok: false, reason: `full-scan produced suspicious global shift (median=${Math.round(medianAbsShiftMs)}ms)` };
+  }
+
+  return {
+    ok: true,
+    reason: 'safety checks passed',
+    stats: {
+      originalCount,
+      candidateCount,
+      medianAbsShiftMs,
+      p95AbsShiftMs,
+      medianDurRatio
+    }
+  };
+}
+
 /**
  * Send progress update to content script
  */
@@ -5184,6 +5603,57 @@ function sendAutoSubTrackOptions(tabId, messageId, tracks, suggestedIndex = 0, e
   chrome.tabs.sendMessage(tabId, payload).catch(err => {
     console.error('[Background] Failed to send auto-sub track options:', err);
   });
+}
+
+const pendingSyncTrackChoices = new Map();
+function clearSyncTrackChoice(messageId) {
+  const entry = pendingSyncTrackChoices.get(messageId);
+  if (!entry) return;
+  if (entry.timeout) clearTimeout(entry.timeout);
+  pendingSyncTrackChoices.delete(messageId);
+}
+function awaitSyncTrackChoice(messageId, defaultIndex = 0, tracks = []) {
+  clearSyncTrackChoice(messageId);
+  const safeDefault = Number.isInteger(defaultIndex) && defaultIndex >= 0 ? defaultIndex : 0;
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      clearSyncTrackChoice(messageId);
+      resolve(safeDefault);
+    }, 120000);
+    pendingSyncTrackChoices.set(messageId, { resolve, timeout, defaultIndex: safeDefault, tracks });
+  });
+}
+function resolveSyncTrackChoice(messageId, trackIndex) {
+  const entry = pendingSyncTrackChoices.get(messageId);
+  if (!entry) return false;
+  const resolvedIndex = Number.isInteger(trackIndex) && trackIndex >= 0 ? trackIndex : entry.defaultIndex;
+  if (entry.timeout) clearTimeout(entry.timeout);
+  pendingSyncTrackChoices.delete(messageId);
+  try {
+    entry.resolve(resolvedIndex);
+    return true;
+  } catch (err) {
+    console.warn('[Background] Failed to resolve pending sync track choice:', err);
+    return false;
+  }
+}
+function sendSyncTrackOptions(tabId, messageId, tracks, suggestedIndex = 0, extractedIndex = 0) {
+  if (!tabId) return;
+  const payload = {
+    type: 'SYNC_TRACK_OPTIONS',
+    messageId,
+    tracks: Array.isArray(tracks) ? tracks : [],
+    suggestedIndex,
+    extractedIndex
+  };
+  chrome.tabs.sendMessage(tabId, payload).catch(err => {
+    console.error('[Background] Failed to send sync track options:', err);
+  });
+  // Backward-compat: older content scripts only forward AUTOSUB_TRACK_OPTIONS.
+  chrome.tabs.sendMessage(tabId, {
+    ...payload,
+    type: 'AUTOSUB_TRACK_OPTIONS'
+  }).catch(() => { });
 }
 
 function buildHeadersFromPage(pageHeaders) {
@@ -5541,10 +6011,16 @@ function planWindows(totalDurationSec, plan) {
   const maxChunkSeconds = Number.isFinite(effective.maxChunkSeconds) ? effective.maxChunkSeconds : null;
   const requestedWindowSeconds = Number.isFinite(effective.requestedWindowSeconds) ? effective.requestedWindowSeconds : null;
 
-  // When fullScan is true and no duration is detected, fallback to maxChunkSeconds or requestedWindowSeconds
-  // This is critical for TS containers (transport streams) where duration probing fails
+  // When fullScan is true and no duration is detected, use a long conservative fallback.
+  // This avoids silently collapsing "Complete" into a very short scan on containers
+  // where probing fails (common with some TS/edge hosts).
   const fullScanFallbackDuration = effective.fullScan
-    ? (maxChunkSeconds || requestedWindowSeconds || PLAN_FULLSCAN_DEFAULT_CHUNK_CAP)
+    ? Math.max(
+      PLAN_FULLSCAN_DEFAULT_CHUNK_CAP,
+      30 * 60,
+      requestedWindowSeconds || 0,
+      maxChunkSeconds || 0
+    )
     : 0;
 
   const inferred = totalDurationSec
@@ -8211,16 +8687,8 @@ async function decodeWindowsWithFFmpeg(windows, mode, onProgress, ctx = null, op
     decoded = await decodeWindowsOffscreen(windows, mode, onProgress, ctx, { audioStreamIndex: opts?.audioStreamIndex });
   } catch (offErr) {
     console.warn('[Background] Offscreen FFmpeg decode failed:', offErr?.message || offErr);
-    // Secondary best-effort local decode (may fail in service worker)
-    try {
-      onProgress?.(75, 'Retrying audio decode locally...');
-      sendDebugLog(ctx?.tabId, ctx?.messageId, `Offscreen decode failed (${offErr?.message || offErr}); retrying locally`, 'warn');
-      decoded = await decodeWindowsLocal(windows, mode, onProgress, { audioStreamIndex: opts?.audioStreamIndex });
-    } catch (localErr) {
-      console.warn('[Background] Local FFmpeg decode also failed:', localErr?.message || localErr);
-      sendDebugLog(ctx?.tabId, ctx?.messageId, `Local FFmpeg decode failed: ${localErr?.message || localErr}`, 'error');
-      throw offErr || localErr;
-    }
+    sendDebugLog(ctx?.tabId, ctx?.messageId, `Offscreen decode failed (${offErr?.message || offErr}); skipping local fallback and escalating to full-fetch retry`, 'warn');
+    throw offErr;
   }
 
   // Validate decoded WAV windows to weed out empty/header-only outputs before autosync.
@@ -8275,8 +8743,8 @@ async function decodeWindowsLocal(windows, mode, onProgress, opts = {}) {
           base.push('-map', `0:a:${opts.audioStreamIndex}`);
         }
         base.push('-acodec', 'pcm_s16le', '-ar', '16000');
-        // Avoid mixing bilingual dual-mono tracks; explicitly keep the left channel only.
-        base.push('-af', 'pan=mono|c0=c0', '-ac', '1');
+        // Standard mono downmix is more robust across stereo layouts than forcing left only.
+        base.push('-ac', '1');
         const args = [...base];
         if (typeof windows[i].durSec === 'number' && windows[i].durSec > 0) {
           args.push('-t', String(windows[i].durSec));
@@ -8349,19 +8817,14 @@ async function getFfsubsync(ctx = null) {
   if (_ffsubsyncReady && _ffsubsyncApi) return _ffsubsyncApi;
   try {
     if (!self.SubMakerFfsubsync) {
-      const loaderUrl = chrome?.runtime?.getURL ? chrome.runtime.getURL('assets/lib/ffsubsync-wasm.js') : 'assets/lib/ffsubsync-wasm.js';
-      if (typeof importScripts !== 'function') {
-        console.warn('[Background] importScripts unavailable for ffsubsync loader');
-        logToPage('ffsubsync loader unavailable in this environment', 'error');
-        return null;
+      if (_ffsubsyncPreloadError) {
+        logToPage(`ffsubsync preload failed: ${_ffsubsyncPreloadError?.message || _ffsubsyncPreloadError}`, 'error');
+      } else if (!_ffsubsyncPreloaded) {
+        logToPage('ffsubsync-wasm wrapper was not preloaded at service worker startup', 'error');
+      } else {
+        logToPage('ffsubsync-wasm wrapper missing after preload', 'error');
       }
-      try {
-        await importScriptSafe(loaderUrl, 'ffsubsync-wasm.js');
-      } catch (loadErr) {
-        console.warn('[Background] Failed to load ffsubsync-wasm wrapper:', loadErr?.message);
-        logToPage(`ffsubsync wrapper load failed: ${loadErr?.message || loadErr}`, 'error');
-        return null;
-      }
+      return null;
     }
     if (!self.SubMakerFfsubsync || typeof self.SubMakerFfsubsync.init !== 'function') {
       console.warn('[Background] ffsubsync-wasm wrapper not found');
@@ -8392,19 +8855,12 @@ async function getAlass(ctx = null) {
         logToPage(`alass preload failed: ${_alassPreloadError?.message || _alassPreloadError}`, 'error');
         return null;
       }
-      const alassUrl = chrome?.runtime?.getURL ? chrome.runtime.getURL('assets/lib/alass-wasm.js') : 'assets/lib/alass-wasm.js';
-      if (typeof importScripts !== 'function') {
-        console.warn('[Background] importScripts unavailable for alass loader');
-        logToPage('alass loader unavailable in this environment', 'error');
-        return null;
+      if (!_alassPreloaded) {
+        logToPage('alass-wasm wrapper was not preloaded at service worker startup', 'error');
+      } else {
+        logToPage('alass-wasm wrapper missing after preload', 'error');
       }
-      try {
-        await importScriptSafe(alassUrl, 'alass-wasm.js');
-      } catch (loadErr) {
-        console.warn('[Background] Failed to load alass-wasm wrapper:', loadErr?.message);
-        logToPage(`alass wrapper load failed: ${loadErr?.message || loadErr}`, 'error');
-        return null;
-      }
+      return null;
     }
     if (!self.SubMakerAlass || !self.SubMakerAlass.init) {
       console.warn('[Background] alass-wasm wrapper not found');
@@ -8413,6 +8869,10 @@ async function getAlass(ctx = null) {
     }
     const wasmPath = chrome?.runtime?.getURL ? chrome.runtime.getURL('assets/lib/alass.wasm') : 'assets/lib/alass.wasm';
     _alassApi = await self.SubMakerAlass.init({ wasmPath });
+    if (!_alassApi || _alassApi.__available === false || typeof _alassApi.alignAudio !== 'function') {
+      const initReason = _alassApi?.__error || 'alass-wasm unavailable';
+      throw new Error(initReason);
+    }
     _alassReady = true;
     console.log('[Background] alass-wasm initialized', { ready: !!_alassApi, hasAlignAudio: !!_alassApi?.alignAudio });
     return _alassApi;

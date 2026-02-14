@@ -6,7 +6,12 @@
  */
 
 (function () {
+  const state = {
+    bindgen: null,
+  };
+
   const Fallback = {
+    __available: false,
     alignAudio: async () => { throw new Error('alass-wasm not available'); },
     alignSubtitles: async () => { throw new Error('alass-wasm not available'); }
   };
@@ -15,19 +20,29 @@
     if (!glueUrl) {
       throw new Error('Missing glue URL for alass-wasm');
     }
-    // If the glue is already present (preloaded via importScripts at startup), skip re-loading.
-    if (typeof wasm_bindgen === 'function') return;
+    if (typeof self.__SubMakerAlassBindgen === 'function') {
+      state.bindgen = self.__SubMakerAlassBindgen;
+      return state.bindgen;
+    }
+    if (typeof state.bindgen === 'function') return state.bindgen;
     if (typeof importScripts !== 'function') {
       throw new Error('importScripts unavailable for alass loader');
     }
+    const previous = self.wasm_bindgen;
     importScripts(glueUrl);
+    if (typeof self.wasm_bindgen !== 'function') {
+      throw new Error('wasm_bindgen not found after loading alass.js');
+    }
+    state.bindgen = self.wasm_bindgen;
+    self.wasm_bindgen = previous;
+    return state.bindgen;
   }
 
   async function toUint8Array(input) {
     if (!input) throw new Error('No audio input provided');
     if (input instanceof Uint8Array) return input;
     if (input instanceof ArrayBuffer) return new Uint8Array(input);
-    if (ArrayBuffer.isView(input)) return new Uint8Array(input.buffer);
+    if (ArrayBuffer.isView(input)) return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
     if (typeof input.arrayBuffer === 'function') {
       const buf = await input.arrayBuffer();
       return new Uint8Array(buf);
@@ -63,10 +78,7 @@
       const glueUrl = (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getURL)
         ? chrome.runtime.getURL('assets/lib/alass.js')
         : 'alass.js';
-      await loadScript(glueUrl);
-      if (typeof wasm_bindgen !== 'function') {
-        throw new Error('wasm_bindgen not found after loading alass.js');
-      }
+      const bindgen = await loadScript(glueUrl);
       const resolvedWasm = wasmPath || (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getURL
         ? chrome.runtime.getURL('assets/lib/alass.wasm')
         : 'alass.wasm');
@@ -75,8 +87,8 @@
         return r.arrayBuffer();
       });
 
-      await wasm_bindgen(wasmBytes);
-      if (typeof wasm_bindgen.align_audio_subtitles !== 'function') {
+      await bindgen(wasmBytes);
+      if (typeof bindgen.align_audio_subtitles !== 'function') {
         throw new Error('align_audio_subtitles export missing in alass-wasm');
       }
 
@@ -88,8 +100,8 @@
         const allowDrift = opts.allowDrift !== false;
 
         let result;
-        if (normalized.windows && normalized.windows.length && typeof wasm_bindgen.align_audio_windows === 'function') {
-          result = wasm_bindgen.align_audio_windows(
+        if (normalized.windows && normalized.windows.length && typeof bindgen.align_audio_windows === 'function') {
+          result = bindgen.align_audio_windows(
             normalized.windows,
             targetSrt || '',
             splitPenalty ?? undefined,
@@ -97,7 +109,7 @@
             allowDrift
           );
         } else {
-          result = wasm_bindgen.align_audio_subtitles(
+          result = bindgen.align_audio_subtitles(
             normalized.bytes,
             targetSrt || '',
             opts.sampleRateHint ?? undefined,
@@ -120,26 +132,26 @@
 
       const alignSubtitles = async (referenceSrt, targetSrt, options = {}) => {
         const { splitPenalty, speedOptimization, allowDrift = true } = options || {};
-        const hasOpts = typeof wasm_bindgen.align_subtitles_opts === 'function';
+        const hasOpts = typeof bindgen.align_subtitles_opts === 'function';
         const out = hasOpts
-          ? wasm_bindgen.align_subtitles_opts(
+          ? bindgen.align_subtitles_opts(
               referenceSrt || '',
               targetSrt || '',
               splitPenalty ?? undefined,
               speedOptimization ?? undefined,
               allowDrift
             )
-          : wasm_bindgen.align_subtitles(referenceSrt || '', targetSrt || '');
+          : bindgen.align_subtitles(referenceSrt || '', targetSrt || '');
         if (!out || typeof out !== 'string') {
           throw new Error('alass-wasm returned empty subtitle result');
         }
         return out;
       };
 
-      return { alignAudio, alignSubtitles };
+      return { __available: true, alignAudio, alignSubtitles };
     } catch (e) {
       console.warn('[alass-wasm] Failed to initialize:', e?.message);
-      return Fallback;
+      return { ...Fallback, __error: e?.message || String(e) };
     }
   }
 

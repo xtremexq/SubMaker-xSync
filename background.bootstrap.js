@@ -5,6 +5,32 @@
 
 // Flag for the full worker so it knows it was bootstrapped.
 self.__xsyncBootstrapped = true;
+self.__xsyncPreloadErrors = self.__xsyncPreloadErrors || {};
+
+// MV3-safe eager preloads. These must be loaded at initial worker evaluation.
+const preloadScripts = [
+  { key: 'transfer', url: 'assets/lib/idb-transfer.js' },
+  { key: 'ffsubsync', url: 'assets/lib/ffsubsync-wasm.js' },
+  { key: 'ffsubsync-glue', url: 'assets/lib/ffsubsync_wasm.js', bindgenAlias: '__SubMakerFfsubsyncBindgen' },
+  { key: 'alass', url: 'assets/lib/alass-wasm.js' },
+  { key: 'alass-glue', url: 'assets/lib/alass.js', bindgenAlias: '__SubMakerAlassBindgen' }
+];
+
+for (const item of preloadScripts) {
+  try {
+    importScripts(item.url);
+    if (item.bindgenAlias) {
+      if (typeof self.wasm_bindgen === 'function') {
+        self[item.bindgenAlias] = self.wasm_bindgen;
+      } else {
+        self.__xsyncPreloadErrors[item.key] = new Error(`wasm_bindgen missing after preloading ${item.url}`);
+      }
+    }
+  } catch (err) {
+    self.__xsyncPreloadErrors[item.key] = err;
+    console.warn(`[SubMaker xSync Bootstrap] Failed to preload ${item.url}:`, err?.message || err);
+  }
+}
 
 // Eagerly load the heavy worker at startup so MV3 doesn't block late importScripts.
 let _heavyLoaded = false;

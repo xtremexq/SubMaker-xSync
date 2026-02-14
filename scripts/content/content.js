@@ -267,6 +267,15 @@ chrome.runtime.onMessage.addListener((msg) => {
       suggestedIndex: msg.suggestedIndex,
       extractedIndex: msg.extractedIndex
     });
+  } else if (msg?.type === 'SYNC_TRACK_OPTIONS') {
+    sendToPage({
+      type: 'SUBMAKER_SYNC_TRACKS',
+      source: 'extension',
+      messageId: msg.messageId,
+      tracks: msg.tracks || [],
+      suggestedIndex: msg.suggestedIndex,
+      extractedIndex: msg.extractedIndex
+    });
   } else if (msg?.type === 'AUTOSUB_RESPONSE') {
     sendToPage({
       type: 'SUBMAKER_AUTOSUB_RESPONSE',
@@ -445,6 +454,10 @@ async function handlePageMessage(event) {
 
       case 'SUBMAKER_AUTOSUB_SELECT_TRACK':
         await handleAutoSubTrackSelection(message);
+        break;
+
+      case 'SUBMAKER_SYNC_SELECT_TRACK':
+        await handleSyncTrackSelection(message);
         break;
 
       case 'SUBMAKER_EMBEDDED_RESET':
@@ -715,6 +728,21 @@ async function handleAutoSubTrackSelection(message) {
     }, 'auto-subtitles-select-track');
   } catch (error) {
     console.error('[SubMaker xSync] Auto-sub track selection failed to forward:', error);
+  }
+}
+
+/**
+ * Handle audio track selection from webpage for paused sync flow
+ */
+async function handleSyncTrackSelection(message) {
+  try {
+    await sendRuntimeMessage({
+      type: 'SYNC_SELECT_TRACK',
+      messageId: message.messageId,
+      trackIndex: message.trackIndex
+    }, 'sync-select-track');
+  } catch (error) {
+    console.error('[SubMaker xSync] Sync track selection failed to forward:', error);
   }
 }
 
