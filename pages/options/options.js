@@ -16,6 +16,7 @@ const DEFAULTS = {
   quietHours: false,
   quietStart: '22:00',
   quietEnd: '07:00',
+  streamBufferMode: 'disk',
   lastSavedAt: null
 };
 
@@ -154,6 +155,14 @@ function applyTranslations() {
   const themeTrueDarkLabel = document.getElementById('themeTrueDarkLabel');
   if (themeTrueDarkLabel) themeTrueDarkLabel.textContent = tOpt('themeTrueDark', 'True Dark');
 
+  const streamBufferModeLabel = document.getElementById('streamBufferModeLabel');
+  if (streamBufferModeLabel) streamBufferModeLabel.textContent = tOpt('streamBufferMode', 'Stream Buffer Mode');
+  const streamBufferModeHint = document.getElementById('streamBufferModeHint');
+  if (streamBufferModeHint) streamBufferModeHint.textContent = tOpt('streamBufferModeHint', 'How large downloads are buffered. Disk is safer for big files; RAM is faster but may crash on files >2 GB.');
+  const streamBufferDisk = document.getElementById('streamBufferDisk');
+  if (streamBufferDisk) streamBufferDisk.textContent = tOpt('streamBufferDisk', 'Disk (default)');
+  const streamBufferRam = document.getElementById('streamBufferRam');
+  if (streamBufferRam) streamBufferRam.textContent = tOpt('streamBufferRam', 'RAM');
   const syncEyebrow = document.getElementById('syncEyebrow');
   if (syncEyebrow) syncEyebrow.textContent = tOpt('syncEyebrow', 'Sync Behaviour');
   const syncTitle = document.getElementById('syncTitle');
@@ -370,6 +379,7 @@ function populate(data) {
   $('quietHours').checked = !!data.quietHours;
   $('quietStart').value = data.quietStart || DEFAULTS.quietStart;
   $('quietEnd').value = data.quietEnd || DEFAULTS.quietEnd;
+  $('streamBufferMode').value = data.streamBufferMode || DEFAULTS.streamBufferMode;
 
   applyTheme(data.theme || DEFAULTS.theme);
 }
@@ -392,7 +402,8 @@ function collectForm() {
     notifySound: $('notifySound').checked,
     quietHours: $('quietHours').checked,
     quietStart: $('quietStart')?.value || DEFAULTS.quietStart,
-    quietEnd: $('quietEnd')?.value || DEFAULTS.quietEnd
+    quietEnd: $('quietEnd')?.value || DEFAULTS.quietEnd,
+    streamBufferMode: $('streamBufferMode')?.value || DEFAULTS.streamBufferMode
   };
 }
 

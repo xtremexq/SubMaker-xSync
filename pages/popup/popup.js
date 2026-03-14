@@ -28,6 +28,7 @@ const reloadBtn = document.getElementById('reloadBtn');
 const openSyncPageBtn = document.getElementById('openSyncPage');
 const openToolboxBtn = document.getElementById('openToolbox');
 const resetExtensionBtn = document.getElementById('resetExtensionBtn');
+const linkedHostUrlEl = document.getElementById('linkedHostUrl');
 const toolsHeader = document.getElementById('toolsHeader');
 const toolsSection = document.getElementById('toolsSection');
 
@@ -53,6 +54,7 @@ async function init() {
     initThemeToggle();
     bindButtons();
     initToolsToggle();
+    updateLinkedHost();
 
     // Do not touch chrome.* APIs on init to avoid waking the background.
     loadSettings(); // local-only
@@ -136,7 +138,9 @@ function applyTranslations() {
 }
 
 function setVersion() {
-    if (versionEl) versionEl.textContent = `v${FALLBACK_VERSION}`;
+    let ver = FALLBACK_VERSION;
+    try { ver = chrome.runtime.getManifest().version; } catch (_) {}
+    if (versionEl) versionEl.textContent = `v${ver}`;
 }
 
 function initThemeToggle() {
@@ -305,6 +309,17 @@ async function resolveTargetUrl(kind) {
     }
 
     return target;
+}
+
+async function updateLinkedHost() {
+    try {
+        const urls = await getStoredUrls();
+        const raw = urls.configure || PUBLIC_BASE;
+        const parsed = new URL(raw);
+        if (linkedHostUrlEl) linkedHostUrlEl.textContent = parsed.host;
+    } catch (_) {
+        if (linkedHostUrlEl) linkedHostUrlEl.textContent = new URL(PUBLIC_BASE).host;
+    }
 }
 
 async function resetExtension() {

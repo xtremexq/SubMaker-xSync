@@ -112,6 +112,16 @@
             </div>
           </div>
         </div>
+        <div class="control-grid">
+          <div class="field">
+            <label for="streamBufferMode" id="streamBufferModeLabel">Stream Buffer Mode</label>
+            <select id="streamBufferMode">
+              <option value="disk" id="streamBufferDisk">Disk (default)</option>
+              <option value="ram" id="streamBufferRam">RAM</option>
+            </select>
+            <p class="hint" id="streamBufferModeHint">How large downloads are buffered. Disk is safer for big files; RAM is faster but may crash on files &gt;2 GB.</p>
+          </div>
+        </div>
       </section>
 
       <section class="card">

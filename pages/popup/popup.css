@@ -344,6 +344,65 @@ body {
     background-image: linear-gradient(90deg, var(--primary) 0%, var(--surface) 50%, var(--primary) 100%);
 }
 
+/* Linked Host Banner */
+.linked-host {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 8px 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    box-shadow: var(--shadow-sm);
+    transition: all 0.25s ease;
+    cursor: default;
+    max-width: 100%;
+    overflow: hidden;
+}
+
+.linked-host:hover {
+    border-color: var(--primary-light);
+    box-shadow: 0 0 0 3px var(--glow), var(--shadow-sm);
+}
+
+.linked-host-icon {
+    width: 14px;
+    height: 14px;
+    color: var(--primary);
+    flex-shrink: 0;
+    stroke-width: 2.2;
+}
+
+.linked-host-label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-tertiary);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.linked-host-url {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+}
+
+[data-theme="dark"] .linked-host {
+    background: rgba(30, 41, 59, 0.7);
+}
+
+[data-theme="true-dark"] .linked-host {
+    background: rgba(0, 0, 0, 0.6);
+    border-color: #262626;
+}
+
 /* Quick Actions */
 .actions-grid {
     display: grid;

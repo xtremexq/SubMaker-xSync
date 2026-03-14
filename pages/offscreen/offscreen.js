@@ -1499,13 +1499,18 @@ async function loadBareFfmpegCore(messageId) {
     },
     run: async (...args) => {
       const argv = Array.isArray(args[0]) ? args[0] : args;
-      const ret = typeof module.exec === 'function'
-        ? module.exec(...argv)
-        : module.callMain
-          ? module.callMain(argv)
-          : 0;
-      if (typeof ret === 'number' && ret !== 0) {
-        throw new Error(`FFmpeg exited with code ${ret}`);
+      if (typeof module.exec === 'function') {
+        const ret = module.exec(...argv);
+        if (typeof ret === 'number' && ret !== 0) {
+          throw new Error(`FFmpeg exited with code ${ret}`);
+        }
+      } else if (typeof module.callMain === 'function') {
+        const ret = module.callMain(argv);
+        if (typeof ret === 'number' && ret !== 0) {
+          throw new Error(`FFmpeg exited with code ${ret}`);
+        }
+      } else {
+        throw new Error('FFmpeg bare core has no exec or callMain entry point — cannot run commands');
       }
     }
   };
@@ -1528,8 +1533,9 @@ async function getFFmpeg(messageId) {
   sendOffscreenLog(`FFmpeg loading... (SAB:${sabAvailable ? 'yes' : 'no'}, COI:${coi === false ? 'no' : 'yes'})`, 'info', messageId);
   const createFFmpeg = await ensureFfmpegFactory();
 
-  // Force bare core to skip worker-based variants that hang in COI/SAB edge cases (faster and more reliable here).
-  const forceBareCore = true;
+  // Bare core bypasses the ffmpeg.wasm wrapper and directly calls the WASM module.
+  // Only enable if the core module actually exports exec/callMain entry points.
+  const forceBareCore = false;
   const buildPaths = (mt) => ({
     corePath: chrome.runtime.getURL(mt ? 'assets/lib/ffmpeg-core-mt.js' : 'assets/lib/ffmpeg-core.js'),
     wasmPath: chrome.runtime.getURL(mt ? 'assets/lib/ffmpeg-core-mt.wasm' : 'assets/lib/ffmpeg-core.wasm'),

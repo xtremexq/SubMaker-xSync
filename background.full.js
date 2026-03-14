@@ -2214,7 +2214,7 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
       const statusMsg = 'Complete mode: downloading full stream...';
       try {
         onProgress(10, statusMsg);
-        const full = await fetchFullStreamBuffer(streamUrl, (p) => onProgress(10 + p * 0.4, statusMsg), baseHeaders);
+        const full = await fetchFullStream(streamUrl, (p) => onProgress(10 + p * 0.4, statusMsg), baseHeaders);
         const fullBuf = full?.buffer || full;
         const probedDur = probeContainerDuration(fullBuf);
         const estimatedDur = !probedDur && fullBuf?.byteLength
@@ -2270,7 +2270,7 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
       if (allowFullFetch) {
         const statusMsg = 'Sample looks partial; downloading full stream for complete coverage...';
         try {
-          const full = await fetchFullStreamBuffer(streamUrl, (p) => onProgress(48 + p * 0.18, statusMsg), baseHeaders);
+          const full = await fetchFullStream(streamUrl, (p) => onProgress(48 + p * 0.18, statusMsg), baseHeaders);
           const fullBuf = full?.buffer || full;
           const probedDur = probeContainerDuration(fullBuf);
           const estimatedDur = !probedDur && fullBuf?.byteLength
@@ -2457,7 +2457,7 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
     const fullFetchRetry = async (reasonLabel) => {
       const statusMsg = reasonLabel || 'Retrying audio decode with full stream...';
       try {
-        const full = await fetchFullStreamBuffer(streamUrl, (p) => onProgress(70 + p * 0.15, statusMsg), baseHeaders);
+        const full = await fetchFullStream(streamUrl, (p) => onProgress(70 + p * 0.15, statusMsg), baseHeaders);
         const fullBuf = full?.buffer || full;
         sample = {
           ...sample,
@@ -3124,7 +3124,7 @@ async function handleAssemblyAutoSubRequest(message, tabId) {
         uploadBlob = new Blob([full.buffer], { type: full.contentType || 'video/mp2t' });
         contentType = uploadBlob.type || full.contentType || 'video/mp2t';
       } else {
-        const full = await fetchFullStreamBuffer(streamUrl, (p) => progress(Math.min(60, p), 'Fetching full stream...', 'fetch'), baseHeaders);
+        const full = await fetchFullStream(streamUrl, (p) => progress(Math.min(60, p), 'Fetching full stream...', 'fetch'), baseHeaders);
         uploadBlob = new Blob([full.buffer], { type: full.contentType || 'video/mp4' });
         contentType = uploadBlob.type || full.contentType || 'video/mp4';
       }
@@ -3594,7 +3594,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
     sendExtractProgress(tabId, messageId, 4, isHls ? 'Complete: downloading full HLS stream...' : 'Complete: downloading full stream...');
     const full = isHls
       ? await fetchFullHlsStream(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(92, 5 + Math.round(p * 0.87)), 'Complete: downloading full HLS stream...'), baseHeaders)
-      : await fetchFullStreamBuffer(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(92, 5 + Math.round(p * 0.87)), 'Complete: downloading full stream...'), baseHeaders);
+      : await fetchFullStream(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(92, 5 + Math.round(p * 0.87)), 'Complete: downloading full stream...'), baseHeaders);
     const fullBuffer = full?.buffer || full;
     const fullBytes = fullBuffer?.byteLength || 0;
     const fullMb = Math.round((fullBytes / (1024 * 1024)) * 10) / 10;
@@ -7107,6 +7107,111 @@ async function fetchFullStreamBuffer(url, onProgress, baseHeaders = null) {
   return { buffer, totalBytes: totalBytes || received, contentType };
 }
 
+/**
+ * Read the user's stream buffer mode preference from xSync settings.
+ * Returns 'disk' (default/safe) or 'ram' (fast/legacy).
+ */
+async function getStreamBufferMode() {
+  try {
+    const stored = await chrome.storage.sync.get('xsync-settings');
+    const settings = stored?.['xsync-settings'];
+    const mode = settings?.streamBufferMode;
+    return (mode === 'ram') ? 'ram' : 'disk';
+  } catch (err) {
+    console.warn('[Background] Could not read streamBufferMode setting, defaulting to disk:', err?.message || err);
+    return 'disk';
+  }
+}
+
+/**
+ * OPFS-based full stream download.
+ * Streams fetch response chunks to an Origin Private File System temp file
+ * instead of allocating a single giant ArrayBuffer in memory.
+ * This avoids "Array buffer allocation failed" OOM errors on large files.
+ *
+ * Returns the same { buffer, totalBytes, contentType } shape as fetchFullStreamBuffer.
+ */
+async function fetchFullStreamBufferOPFS(url, onProgress, baseHeaders = null) {
+  const fetchOpts = baseHeaders ? { headers: baseHeaders } : undefined;
+  const res = await safeFetch(url, fetchOpts);
+  if (!res.ok) {
+    throw new Error(`Full fetch failed (HTTP ${res.status})`);
+  }
+  const contentType = res.headers?.get?.('content-type') || '';
+  const totalBytes = parseInt(res.headers.get('content-length') || '0', 10) || null;
+  const reader = res.body && typeof res.body.getReader === 'function' ? res.body.getReader() : null;
+  if (!reader) {
+    // No streaming body — fall back to simple arrayBuffer (usually small responses)
+    const buf = await res.arrayBuffer();
+    onProgress?.(100);
+    return { buffer: buf, totalBytes: totalBytes || (buf?.byteLength || null), contentType };
+  }
+
+  // Generate a unique temp filename to avoid collisions across concurrent jobs
+  const tempName = `submaker_stream_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.tmp`;
+  let root, fileHandle, writable;
+
+  try {
+    root = await navigator.storage.getDirectory();
+    fileHandle = await root.getFileHandle(tempName, { create: true });
+    writable = await fileHandle.createWritable();
+
+    let received = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.length) {
+        await writable.write(value);
+        received += value.length;
+        const pct = totalBytes ? Math.round((received / totalBytes) * 95) : Math.min(95, Math.round(received / (1024 * 1024)));
+        onProgress?.(Math.min(95, pct));
+      }
+    }
+
+    await writable.close();
+    writable = null; // Mark as closed so finally doesn't double-close
+
+    // Read the completed file back as an ArrayBuffer
+    const file = await fileHandle.getFile();
+    const buffer = await file.arrayBuffer();
+
+    onProgress?.(100);
+    return { buffer, totalBytes: totalBytes || received, contentType };
+  } finally {
+    // Clean up: close writable if still open, then remove the temp file
+    if (writable) {
+      try { await writable.close(); } catch (_) { /* already closed or errored */ }
+    }
+    if (root && tempName) {
+      try { await root.removeEntry(tempName); } catch (_) { /* best-effort cleanup */ }
+    }
+  }
+}
+
+/**
+ * Dispatcher: fetch full stream buffer using the user's preferred mode (disk/ram).
+ * All callers should use this instead of fetchFullStreamBuffer directly.
+ */
+async function fetchFullStream(url, onProgress, baseHeaders = null) {
+  const mode = await getStreamBufferMode();
+  if (mode === 'ram') {
+    return fetchFullStreamBuffer(url, onProgress, baseHeaders);
+  }
+  // Default to OPFS (disk) mode — safer for large files
+  try {
+    return await fetchFullStreamBufferOPFS(url, onProgress, baseHeaders);
+  } catch (opfsErr) {
+    // If OPFS is unavailable (e.g. older browser, permissions), fall back to RAM silently
+    const isOPFSUnavailable = /getDirectory|storage|OPFS|SecurityError|NotAllowedError/i.test(opfsErr?.message || opfsErr?.name || '');
+    if (isOPFSUnavailable) {
+      console.warn('[Background] OPFS unavailable, falling back to RAM mode:', opfsErr?.message || opfsErr);
+      return fetchFullStreamBuffer(url, onProgress, baseHeaders);
+    }
+    throw opfsErr;
+  }
+}
+
 async function fetchFullHlsStream(m3u8Url, onProgress, baseHeaders = null) {
   const { segments, totalDurationSec, map } = await resolveHlsPlaylist(m3u8Url, baseHeaders);
   const buffers = [];
@@ -8616,13 +8721,18 @@ async function loadBareFfmpegCore() {
       },
       run: async (...args) => {
         const argv = Array.isArray(args[0]) ? args[0] : args;
-        const ret = typeof module.exec === 'function'
-          ? module.exec(...argv)
-          : module.callMain
-            ? module.callMain(argv)
-            : 0;
-        if (typeof ret === 'number' && ret !== 0) {
-          throw new Error(`FFmpeg exited with code ${ret}`);
+        if (typeof module.exec === 'function') {
+          const ret = module.exec(...argv);
+          if (typeof ret === 'number' && ret !== 0) {
+            throw new Error(`FFmpeg exited with code ${ret}`);
+          }
+        } else if (typeof module.callMain === 'function') {
+          const ret = module.callMain(argv);
+          if (typeof ret === 'number' && ret !== 0) {
+            throw new Error(`FFmpeg exited with code ${ret}`);
+          }
+        } else {
+          throw new Error('FFmpeg bare core has no exec or callMain entry point — cannot run commands');
         }
       }
     };
