@@ -33,12 +33,12 @@ self.addEventListener('unhandledrejection', (evt) => {
 
 // Shared state
 let _ffmpegInstance = null;
-let _ffmpegFactory = null;
 let _ffmpegMode = 'unknown';
 let _bareFfmpegModule = null;
-let _workerLooksStub = null;
+let _ffmpegLoadPromise = null;
 let _debugEnabled = true; // default to verbose so extraction failures surface without manual toggles
 const _chunkedBuffers = new Map();
+const _activeOffscreenJobs = new Map();
 const CHUNK_BUFFER_TTL_MS = 5 * 60 * 1000;
 const OUTGOING_CHUNK_BYTES = 512 * 1024;
 const OUTGOING_CHUNK_THRESHOLD = 2.5 * 1024 * 1024; // approx 2.5MB before chunking
@@ -111,6 +111,54 @@ function consumeChunkedBuffer(transferId) {
   if (entry.timer) clearTimeout(entry.timer);
   _chunkedBuffers.delete(transferId);
   return merged;
+}
+
+function createAbortError(reason = 'Operation aborted') {
+  const message = typeof reason === 'string' && reason ? reason : 'Operation aborted';
+  const err = new Error(message);
+  err.name = 'AbortError';
+  return err;
+}
+
+function isAbortError(err) {
+  if (!err) return false;
+  return err.name === 'AbortError'
+    || err.code === 'ABORT_ERR'
+    || /aborted|cancelled|canceled/i.test(err?.message || '');
+}
+
+function beginOffscreenJob(messageId) {
+  if (!messageId) return null;
+  const job = {
+    messageId,
+    aborted: false,
+    reason: '',
+    startedAt: Date.now()
+  };
+  _activeOffscreenJobs.set(messageId, job);
+  return job;
+}
+
+function finishOffscreenJob(messageId) {
+  if (!messageId) return;
+  _activeOffscreenJobs.delete(messageId);
+}
+
+function markOffscreenJobAborted(messageId, reason = 'Operation aborted') {
+  if (!messageId) return false;
+  const job = _activeOffscreenJobs.get(messageId);
+  if (!job) return false;
+  job.aborted = true;
+  job.reason = reason || 'Operation aborted';
+  return true;
+}
+
+function throwIfOffscreenJobAborted(messageId) {
+  if (!messageId) return;
+  const job = _activeOffscreenJobs.get(messageId);
+  if (job?.aborted) {
+    throw createAbortError(job.reason || 'Operation aborted');
+  }
 }
 
 async function sendResultChunksToBackground(transferId, buffer, messageId, label = 'result') {
@@ -928,6 +976,111 @@ function collectSubtitleLanguagesFromHeader(buffer) {
   return [];
 }
 
+function isSubtitleAttachmentFile(att) {
+  if (!att) return false;
+  const lowerName = String(att.name || '').toLowerCase();
+  const lowerMime = String(att.mime || '').toLowerCase();
+  return lowerMime.startsWith('text/')
+    || lowerMime.includes('subtitle')
+    || lowerName.endsWith('.srt')
+    || lowerName.endsWith('.ass')
+    || lowerName.endsWith('.ssa')
+    || lowerName.endsWith('.vtt')
+    || lowerName.endsWith('.sub');
+}
+
+function probeMkvSubtitleMetadata(buffer) {
+  if (!buffer || typeof buffer.byteLength !== 'number' || buffer.byteLength === 0) return null;
+  try {
+    const scanBytes = Math.min(buffer.byteLength, 24 * 1024 * 1024);
+    const headerInfo = parseMkvHeaderInfo(buffer, { maxScanBytes: scanBytes });
+    const tracks = Array.isArray(headerInfo?.tracks) ? headerInfo.tracks : [];
+    const subtitleTracks = tracks.filter((t) => {
+      const codec = String(t?.codecId || '').toLowerCase();
+      return t?.type === 0x11 || t?.type === 17 || codec.includes('s_text') || codec.includes('subtitle') || codec.includes('subrip') || codec.includes('ass') || codec.includes('pgs');
+    });
+    const subtitleAttachments = (headerInfo?.attachments || []).filter(isSubtitleAttachmentFile);
+    return {
+      scanBytes,
+      tracks,
+      subtitleTracks,
+      subtitleAttachments
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function formatMkvTrackProbe(track) {
+  if (!track) return '';
+  let typeLabel = 'unknown';
+  if (track.type === 0x01 || track.type === 1) typeLabel = 'video';
+  else if (track.type === 0x02 || track.type === 2) typeLabel = 'audio';
+  else if (track.type === 0x11 || track.type === 17) typeLabel = 'subtitle';
+  else if (track.type === 0x12 || track.type === 18) typeLabel = 'buttons';
+  else if (typeof track.type === 'number') typeLabel = `type=${track.type}`;
+  const parts = [`#${track.number ?? '?'}`, typeLabel];
+  if (track.codecId) parts.push(track.codecId);
+  if (track.languageIetf || track.language) parts.push(track.languageIetf || track.language);
+  if (track.name) parts.push(`"${track.name}"`);
+  return parts.join(' ');
+}
+
+function isTextSubtitleCodec(codecId) {
+  const codec = String(codecId || '').toLowerCase();
+  if (!codec) return false;
+  return codec.includes('s_text')
+    || codec.includes('subrip')
+    || codec.includes('utf8')
+    || codec.includes('ssa')
+    || codec.includes('ass')
+    || codec.includes('webvtt')
+    || codec.includes('vtt')
+    || codec.includes('mov_text')
+    || codec.includes('tx3g');
+}
+
+function isBitmapSubtitleCodec(codecId) {
+  const codec = String(codecId || '').toLowerCase();
+  if (!codec) return false;
+  return codec.includes('pgs')
+    || codec.includes('hdmv')
+    || codec.includes('vobsub')
+    || codec.includes('dvd_subtitle')
+    || codec.includes('dvb_subtitle')
+    || codec.includes('xsub')
+    || codec.includes('pgssub')
+    || codec.includes('sup');
+}
+
+function buildMkvSubtitleExtractionPlan(mkvProbe) {
+  if (!Array.isArray(mkvProbe?.subtitleTracks) || !mkvProbe.subtitleTracks.length) return [];
+  return mkvProbe.subtitleTracks.map((track, idx) => {
+    const codecId = String(track?.codecId || '');
+    const kind = isTextSubtitleCodec(codecId)
+      ? 'text'
+      : (isBitmapSubtitleCodec(codecId) ? 'bitmap' : 'unknown');
+    return {
+      streamIndex: idx,
+      outputIndex: idx + 1,
+      kind,
+      codecId,
+      trackNumber: typeof track?.number === 'number' ? track.number : null,
+      language: track?.languageIetf || track?.language || '',
+      name: track?.name || ''
+    };
+  });
+}
+
+function isNoSubtitleStreamErrorMessage(message) {
+  const lower = String(message || '').toLowerCase();
+  return lower.includes('matches no streams')
+    || lower.includes('does not contain any stream')
+    || lower.includes('output file does not contain any stream')
+    || lower.includes('stream map')
+    || lower.includes('no stream');
+}
+
 function applyHeaderLanguagesToTracks(tracks, headerLangs) {
   if (!Array.isArray(tracks) || !tracks.length || !Array.isArray(headerLangs) || !headerLangs.length) return tracks || [];
   const usable = headerLangs.filter((l) => l && l.lang);
@@ -1413,72 +1566,16 @@ function isHttpUrl(url) {
   return /^https?:\/\//i.test(String(url || ''));
 }
 
-async function workerScriptLooksStub(url) {
-  if (_workerLooksStub !== null) return _workerLooksStub;
-  if (!url) return false;
-  try {
-    const res = await fetch(url, { cache: 'no-store' });
-    if (!res.ok) return false;
-    const text = await res.text();
-    _workerLooksStub = text.length < 1024 && /placeholder/i.test(text);
-    if (_workerLooksStub) {
-      sendOffscreenLog('Detected placeholder FFmpeg worker; will prefer bare core fallback', 'warn');
-    }
-    return _workerLooksStub;
-  } catch (_) {
-    _workerLooksStub = false;
-    return false;
-  }
-}
-
-async function ensureFfmpegFactory() {
-  if (_ffmpegFactory) return _ffmpegFactory;
-
-  const wireUpWasmShim = () => {
-    if (!self.createFFmpeg && self.FFmpegWASM?.FFmpeg) {
-      self.FFmpeg = self.FFmpegWASM;
-      self.createFFmpeg = (opts = {}) => new self.FFmpegWASM.FFmpeg(opts);
-    }
-    return self.createFFmpeg || (self.FFmpeg && self.FFmpeg.createFFmpeg);
-  };
-
-  let factory = wireUpWasmShim();
-  const tryLoad = async (url, label) => {
-    if (!url) return;
-    try {
-      sendOffscreenLog(`Loading FFmpeg loader: ${label}`, 'info');
-      await loadScriptTag(url, label);
-      factory = wireUpWasmShim();
-      if (factory) {
-        console.log(`[Offscreen] FFmpeg loader ready via ${label}`);
-        sendOffscreenLog(`FFmpeg loader ready via ${label}`, 'info');
-      }
-    } catch (err) {
-      console.warn(`[Offscreen] Failed to load FFmpeg loader from ${label}:`, err?.message || err);
-      sendOffscreenLog(`FFmpeg loader failed via ${label}: ${err?.message || err}`, 'warn');
-    }
-  };
-
-  const runtimeUrl = chrome.runtime.getURL('assets/lib/ffmpeg.js');
-  await tryLoad(runtimeUrl, 'bundled ffmpeg.js');
-  if (!factory) {
-    await tryLoad('assets/lib/ffmpeg.js', 'fallback ffmpeg.js');
-  }
-  if (!factory) {
-    throw new Error('FFmpeg loader unavailable in offscreen context.');
-  }
-  _ffmpegFactory = factory;
-  return factory;
-}
-
 async function loadBareFfmpegCore(messageId) {
   if (_bareFfmpegModule && _ffmpegInstance) return _ffmpegInstance;
   const coreUrl = chrome.runtime.getURL('assets/lib/ffmpeg-core.js');
-  sendOffscreenLog('Falling back to direct FFmpeg core (no worker)...', 'warn', messageId);
+  sendOffscreenLog('Loading direct FFmpeg core...', 'info', messageId);
+  throwIfOffscreenJobAborted(messageId);
   await loadScriptTag(coreUrl, 'ffmpeg-core.js', messageId);
   if (typeof self.createFFmpegCore !== 'function') {
     throw new Error('createFFmpegCore not found after loading core script');
   }
+  throwIfOffscreenJobAborted(messageId);
   const module = await withTimeout(self.createFFmpegCore({
     locateFile: (path) => {
       if (path.endsWith('.wasm')) return chrome.runtime.getURL('assets/lib/ffmpeg-core.wasm');
@@ -1487,7 +1584,54 @@ async function loadBareFfmpegCore(messageId) {
     },
     print: (msg) => sendOffscreenLog(msg, 'info', messageId),
     printErr: (msg) => sendOffscreenLog(msg, 'warn', messageId)
-  }), 45000, 'Bare FFmpeg core load timed out');
+  }), 120000, 'Bare FFmpeg core load timed out');
+
+  let userLogger = null;
+  let userProgress = null;
+  let lastRunLogs = [];
+  const MAX_CAPTURED_LOGS = 400;
+
+  const relayModuleLog = (entry) => {
+    if (entry?.message) {
+      lastRunLogs.push(entry);
+      if (lastRunLogs.length > MAX_CAPTURED_LOGS) {
+        lastRunLogs.shift();
+      }
+    }
+    if (typeof userLogger === 'function') {
+      try {
+        userLogger(entry);
+      } catch (_) { /* ignore logger failures */ }
+    }
+  };
+
+  if (typeof module.setLogger === 'function') {
+    module.setLogger(relayModuleLog);
+  }
+  if (typeof module.setProgress === 'function') {
+    module.setProgress((entry) => {
+      if (typeof userProgress === 'function') {
+        try {
+          userProgress(entry);
+        } catch (_) { /* ignore progress failures */ }
+      }
+    });
+  }
+
+  const buildRunError = (ret, fallbackLabel) => {
+    const stderrLines = lastRunLogs
+      .filter((entry) => String(entry?.type || '').toLowerCase().includes('stderr') && entry?.message)
+      .map((entry) => String(entry.message || '').trim())
+      .filter(Boolean)
+      .slice(-12);
+    const message = stderrLines.length
+      ? stderrLines.join('\n')
+      : `${fallbackLabel} exited with code ${ret}`;
+    const err = new Error(message);
+    err.code = ret;
+    err.ffmpegLogs = lastRunLogs.slice();
+    return err;
+  };
 
   const ffmpeg = {
     FS: (cmd, ...args) => {
@@ -1497,21 +1641,52 @@ async function loadBareFfmpegCore(messageId) {
       if (typeof target.FS === 'function') return target.FS(cmd, ...args);
       throw new Error(`FFmpeg FS command unavailable: ${cmd}`);
     },
+    setLogger: (logger) => {
+      userLogger = typeof logger === 'function' ? logger : null;
+    },
+    setProgress: (handler) => {
+      userProgress = typeof handler === 'function' ? handler : null;
+    },
+    setLogLevel: () => { /* bare core does not expose log levels */ },
+    reset: () => {
+      if (typeof module.reset === 'function') {
+        module.reset();
+      }
+    },
     run: async (...args) => {
       const argv = Array.isArray(args[0]) ? args[0] : args;
+      lastRunLogs = [];
+      if (typeof module.reset === 'function') {
+        module.reset();
+      }
       if (typeof module.exec === 'function') {
         const ret = module.exec(...argv);
         if (typeof ret === 'number' && ret !== 0) {
-          throw new Error(`FFmpeg exited with code ${ret}`);
+          throw buildRunError(ret, 'FFmpeg');
         }
       } else if (typeof module.callMain === 'function') {
         const ret = module.callMain(argv);
         if (typeof ret === 'number' && ret !== 0) {
-          throw new Error(`FFmpeg exited with code ${ret}`);
+          throw buildRunError(ret, 'FFmpeg');
         }
       } else {
-        throw new Error('FFmpeg bare core has no exec or callMain entry point — cannot run commands');
+        throw new Error('FFmpeg bare core has no exec or callMain entry point and cannot run commands');
       }
+    },
+    ffprobe: async (...args) => {
+      const argv = Array.isArray(args[0]) ? args[0] : args;
+      lastRunLogs = [];
+      if (typeof module.reset === 'function') {
+        module.reset();
+      }
+      if (typeof module.ffprobe === 'function') {
+        const ret = module.ffprobe(...argv);
+        if (typeof ret === 'number' && ret !== 0) {
+          throw buildRunError(ret, 'FFprobe');
+        }
+        return ret;
+      }
+      throw new Error('FFmpeg bare core has no ffprobe entry point');
     }
   };
 
@@ -1527,102 +1702,27 @@ async function getFFmpeg(messageId) {
     sendOffscreenLog(`FFmpeg already loaded (${_ffmpegMode})`, 'info', messageId);
     return _ffmpegInstance;
   }
+  if (_ffmpegLoadPromise) {
+    return _ffmpegLoadPromise;
+  }
 
   const sabAvailable = typeof SharedArrayBuffer !== 'undefined';
   const coi = self.crossOriginIsolated;
   sendOffscreenLog(`FFmpeg loading... (SAB:${sabAvailable ? 'yes' : 'no'}, COI:${coi === false ? 'no' : 'yes'})`, 'info', messageId);
-  const createFFmpeg = await ensureFfmpegFactory();
-
-  // Bare core bypasses the ffmpeg.wasm wrapper and directly calls the WASM module.
-  // Only enable if the core module actually exports exec/callMain entry points.
-  const forceBareCore = false;
-  const buildPaths = (mt) => ({
-    corePath: chrome.runtime.getURL(mt ? 'assets/lib/ffmpeg-core-mt.js' : 'assets/lib/ffmpeg-core.js'),
-    wasmPath: chrome.runtime.getURL(mt ? 'assets/lib/ffmpeg-core-mt.wasm' : 'assets/lib/ffmpeg-core.wasm'),
-    workerPath: mt ? chrome.runtime.getURL('assets/lib/ffmpeg-core-mt.worker.js') : null,
-    mainName: mt ? 'ffmpeg-core-mt' : 'ffmpeg-core'
-  });
-
-  const preferBare = forceBareCore || await workerScriptLooksStub(buildPaths(false).workerPath);
-
-  if (preferBare) {
-    try {
-      const bareReason = forceBareCore
-        ? 'Forcing bare FFmpeg core (single-thread, no worker)'
-        : 'Using bare FFmpeg core because worker script is a placeholder';
-      sendOffscreenLog(bareReason, 'warn', messageId);
-      _ffmpegInstance = await loadBareFfmpegCore(messageId);
-      return _ffmpegInstance;
-    } catch (err) {
-      sendOffscreenLog(`Bare core quick path failed; retrying standard loader (${err?.message || err})`, 'warn', messageId);
-    }
-  }
-
-  const loadWithMode = async (mt) => {
-    const paths = buildPaths(mt);
-    sendOffscreenLog(`Loading FFmpeg core (${mt ? 'multi-thread' : 'single-thread'})...`, 'info', messageId);
-
-    const toBlobUrl = async (url, type) => {
-      const res = await fetch(url, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`Fetch failed for ${url} (${res.status})`);
-      const buf = await res.arrayBuffer();
-      return URL.createObjectURL(new Blob([buf], { type }));
-    };
-
-    let corePath = paths.corePath;
-    let wasmPath = paths.wasmPath;
-    let workerPath = paths.workerPath;
-
-    // For mt, load via Blob URLs so the worker inherits the offscreen document's COI/SAB context.
-    if (mt) {
-      corePath = await toBlobUrl(paths.corePath, 'application/javascript');
-      wasmPath = await toBlobUrl(paths.wasmPath, 'application/wasm');
-      workerPath = paths.workerPath ? await toBlobUrl(paths.workerPath, 'application/javascript') : null;
-    }
-
-    const ffmpeg = createFFmpeg({
-      log: true,
-      logger: ({ type, message }) => {
-        const level = type === 'fferr' ? 'warn' : 'info';
-        sendOffscreenLog(message, level, messageId);
-      },
-      corePath,
-      wasmPath,
-      ...(workerPath ? { workerPath } : {}),
-      mainName: paths.mainName
-    });
-    const loadTimeout = mt ? 120000 : 45000;
-    await withTimeout(ffmpeg.load(), loadTimeout, `FFmpeg ${mt ? 'multi-thread' : 'single-thread'} load timed out`);
-    _ffmpegMode = mt ? 'multi-thread' : 'single-thread';
-    sendOffscreenLog(`FFmpeg load finished (${_ffmpegMode})`, 'info', messageId);
+  sendOffscreenLog(
+    'Using direct FFmpeg core in the offscreen page.',
+    'info',
+    messageId
+  );
+  _ffmpegLoadPromise = (async () => {
+    const ffmpeg = await loadBareFfmpegCore(messageId);
+    _ffmpegInstance = ffmpeg;
     return ffmpeg;
-  };
-
-  const preferMt = sabAvailable;
-  let lastErr = null;
-  const modes = preferMt ? [true, false] : [false];
-  if (preferMt && coi === false) {
-    sendOffscreenLog('Cross-origin isolation disabled; will attempt multi-thread FFmpeg and fall back if blocked', 'warn', messageId);
-  }
-  for (const mt of modes) {
-    try {
-      _ffmpegInstance = await loadWithMode(mt);
-      return _ffmpegInstance;
-    } catch (err) {
-      lastErr = err;
-      const level = mt && modes.length > 1 ? 'warn' : 'error';
-      sendOffscreenLog(`FFmpeg ${mt ? 'multi-thread' : 'single-thread'} load failed: ${err?.message || err}`, level, messageId);
-      console.warn('[Offscreen] FFmpeg load failed:', err);
-    }
-  }
-
+  })();
   try {
-    sendOffscreenLog('Attempting bare FFmpeg core fallback after worker load failure...', 'warn', messageId);
-    return await loadBareFfmpegCore(messageId);
-  } catch (fallbackErr) {
-    console.warn('[Offscreen] Bare FFmpeg fallback failed:', fallbackErr);
-    sendOffscreenLog(`Bare FFmpeg core fallback failed: ${fallbackErr?.message || fallbackErr}`, 'error', messageId);
-    throw lastErr || fallbackErr || new Error('FFmpeg load failed in offscreen page.');
+    return await _ffmpegLoadPromise;
+  } finally {
+    _ffmpegLoadPromise = null;
   }
 }
 
@@ -1702,6 +1802,109 @@ async function decodeAudioWindows(windows, mode, messageId, opts = {}) {
   return results;
 }
 
+function cleanupFsFile(ffmpeg, file) {
+  if (!file) return;
+  try {
+    ffmpeg.FS('unlink', file);
+  } catch (_) { /* ignore */ }
+}
+
+function getSubtitleExtractionTargets(opts = {}) {
+  const explicitPlans = Array.isArray(opts.streamPlans)
+    ? opts.streamPlans.filter((entry) => entry && Number.isInteger(entry.streamIndex) && entry.streamIndex >= 0)
+    : [];
+  if (explicitPlans.length) {
+    return explicitPlans.map((entry) => ({
+      streamIndex: entry.streamIndex,
+      outputIndex: Number.isInteger(entry.outputIndex) ? entry.outputIndex : (entry.streamIndex + 1),
+      kind: entry.kind || 'unknown'
+    }));
+  }
+  const maxTracks = Math.max(1, opts.maxTracks || 32);
+  return Array.from({ length: maxTracks }, (_, idx) => ({
+    streamIndex: idx,
+    outputIndex: idx + 1,
+    kind: 'unknown'
+  }));
+}
+
+async function extractSubtitleCopyTracks(ffmpeg, inputName, messageId, opts = {}) {
+  const copiedTracks = [];
+  const targets = getSubtitleExtractionTargets(opts);
+  for (const target of targets) {
+    throwIfOffscreenJobAborted(messageId);
+    const streamIndex = target.streamIndex;
+    const outputIndex = target.outputIndex;
+    const outName = formatExtractedName(outputIndex, 'mkv');
+    cleanupFsFile(ffmpeg, outName);
+    try {
+      await ffmpeg.run(
+        '-y',
+        '-analyzeduration', '60M',
+        '-probesize', '60M',
+        '-i', inputName,
+        '-map', `0:s:${streamIndex}`,
+        '-c:s', 'copy',
+        outName
+      );
+      const data = ffmpeg.FS('readFile', outName);
+      if (data?.byteLength > 0) {
+        copiedTracks.push(outName);
+        continue;
+      }
+      cleanupFsFile(ffmpeg, outName);
+      break;
+    } catch (err) {
+      cleanupFsFile(ffmpeg, outName);
+      if (isNoSubtitleStreamErrorMessage(err?.message || err)) {
+        break;
+      }
+      sendOffscreenLog(`Subtitle copy failed for stream ${streamIndex + 1}: ${err?.message || err}`, 'warn', messageId);
+    }
+  }
+  return copiedTracks;
+}
+
+async function extractSubtitleTextTracks(ffmpeg, inputName, messageId, opts = {}) {
+  const variant = opts.variant || '';
+  const extracted = [];
+  const targets = getSubtitleExtractionTargets(opts);
+  const outputArgs = Array.isArray(opts.outputArgs) ? opts.outputArgs : [];
+  const outputExt = opts.ext || 'srt';
+  const inputArgs = Array.isArray(opts.inputArgs) ? opts.inputArgs : [];
+  for (const target of targets) {
+    throwIfOffscreenJobAborted(messageId);
+    const streamIndex = target.streamIndex;
+    const outputIndex = target.outputIndex;
+    const outName = formatExtractedName(outputIndex, outputExt, variant);
+    cleanupFsFile(ffmpeg, outName);
+    try {
+      await ffmpeg.run(
+        '-y',
+        ...inputArgs,
+        '-i', inputName,
+        '-map', `0:s:${streamIndex}`,
+        '-c:s', 'srt',
+        ...outputArgs,
+        outName
+      );
+      const data = ffmpeg.FS('readFile', outName);
+      if (data?.byteLength > 0) {
+        extracted.push(outName);
+      } else {
+        cleanupFsFile(ffmpeg, outName);
+      }
+    } catch (err) {
+      cleanupFsFile(ffmpeg, outName);
+      if (isNoSubtitleStreamErrorMessage(err?.message || err)) {
+        break;
+      }
+      sendOffscreenLog(`Text subtitle conversion failed for stream ${streamIndex + 1}: ${err?.message || err}`, 'warn', messageId);
+    }
+  }
+  return extracted;
+}
+
 async function demuxSubtitles(buffer, messageId) {
   const byteLength = typeof buffer?.byteLength === 'number'
     ? buffer.byteLength
@@ -1713,10 +1916,40 @@ async function demuxSubtitles(buffer, messageId) {
     throw new Error('Empty buffer received for demux.');
   }
   const view = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  const mkvProbe = probeMkvSubtitleMetadata(view);
+  const subtitlePlan = buildMkvSubtitleExtractionPlan(mkvProbe);
+  const plannedTextStreams = subtitlePlan.filter((entry) => entry.kind === 'text');
+  const plannedBitmapStreams = subtitlePlan.filter((entry) => entry.kind !== 'text');
+  if (mkvProbe) {
+    const scanMb = Math.round((mkvProbe.scanBytes / (1024 * 1024)) * 10) / 10;
+    const summaryBits = [
+      `tracks=${mkvProbe.tracks.length}`,
+      `subtitleTracks=${mkvProbe.subtitleTracks.length}`,
+      `subtitleAttachments=${mkvProbe.subtitleAttachments.length}`
+    ];
+    sendOffscreenLog(`MKV header probe (${scanMb} MB scan): ${summaryBits.join(', ')}`, 'info', messageId);
+    const trackSummary = mkvProbe.tracks
+      .slice(0, 8)
+      .map(formatMkvTrackProbe)
+      .filter(Boolean)
+      .join(' | ');
+    if (trackSummary) {
+      sendOffscreenLog(`MKV track entries: ${trackSummary}`, 'info', messageId);
+    }
+    if (subtitlePlan.length) {
+      sendOffscreenLog(
+        `MKV subtitle plan: ${plannedTextStreams.length} text, ${plannedBitmapStreams.length} bitmap/unknown`,
+        'info',
+        messageId
+      );
+    }
+  }
   const ffmpeg = await getFFmpeg(messageId);
+  throwIfOffscreenJobAborted(messageId);
   if (ffmpeg?.setLogger) {
     ffmpeg.setLogger(({ type, message }) => {
-      const level = type === 'fferr' ? 'warn' : 'info';
+      const lowerType = String(type || '').toLowerCase();
+      const level = (lowerType === 'fferr' || lowerType === 'stderr') ? 'warn' : 'info';
       sendOffscreenLog(message, level, messageId);
     });
   }
@@ -1726,85 +1959,52 @@ async function demuxSubtitles(buffer, messageId) {
   const inputName = 'embedded_input.bin';
   sendOffscreenLog('Writing input buffer to FFmpeg FS...', 'info', messageId);
   ffmpeg.FS('writeFile', inputName, view);
+  let copiedTracks = [];
+  let files = [];
+  const convertedSrts = [];
   try {
     sendOffscreenLog('Running FFmpeg to extract subtitle streams...', 'info', messageId);
-    const srtSeqPattern = `${EXTRACTED_PREFIX}_%02d.srt`;
-    // Try generous probe and srt conversion first
-    const baseArgs = [
-      '-y',
-      '-analyzeduration', '60M',
-      '-probesize', '60M',
-      '-i', inputName,
-      '-map', '0:s?',
-      '-c:s', 'srt',
-      '-start_number', '1',
-      srtSeqPattern
-    ];
-    try {
-      await ffmpeg.run(...baseArgs);
-    } catch (primaryErr) {
-      sendOffscreenLog(`Primary demux attempt failed (${primaryErr?.message || primaryErr}); retrying with stream copy`, 'warn', messageId);
-      // Fallback: stream copy to keep bitmap/ass subs intact
-      await ffmpeg.run(
-        '-y',
-        '-analyzeduration', '60M',
-        '-probesize', '60M',
-        '-i', inputName,
-        '-map', '0:s?',
-        '-c:s', 'copy',
-        '-f', 'matroska',
-        'embedded_subs.mkv'
-      );
+    copiedTracks = await extractSubtitleCopyTracks(ffmpeg, inputName, messageId, {
+      ...(subtitlePlan.length ? { streamPlans: subtitlePlan } : {})
+    });
+    files = await extractSubtitleTextTracks(ffmpeg, inputName, messageId, {
+      ...(plannedTextStreams.length ? { streamPlans: plannedTextStreams } : {}),
+      inputArgs: ['-analyzeduration', '60M', '-probesize', '60M']
+    });
+    if (copiedTracks.length) {
+      sendOffscreenLog(`Preserved ${copiedTracks.length} subtitle stream(s) as MKV copy for fallback/OCR`, 'info', messageId);
     }
   } catch (err) {
+    const errMsg = err?.message || String(err);
     console.error('[Offscreen] FFmpeg demux failed:', err);
-    sendOffscreenLog(`FFmpeg demux failed: ${err?.message || err}`, 'error', messageId);
-    throw new Error('FFmpeg could not extract subtitle tracks (no subtitle streams or FFmpeg unavailable).');
+    sendOffscreenLog(`FFmpeg demux failed: ${errMsg}`, 'error', messageId);
+    if (
+      /^No subtitle streams found in media\.?$/i.test(errMsg)
+      || /^Image-based subtitle streams require OCR/i.test(errMsg)
+      || /^FFmpeg demux failed:/i.test(errMsg)
+      || isAbortError(err)
+    ) {
+      throw err;
+    }
+    throw new Error(`FFmpeg demux failed: ${errMsg}`);
   }
 
-  // Gather initial SRT outputs
-  let files = ffmpeg.FS('readdir', '/')
-    .filter(f => EXTRACTED_SRT_PATTERN.test(f))
-    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-
-  const mkvExists = ffmpeg.FS('readdir', '/').includes('embedded_subs.mkv');
-  const copiedTracks = [];
-  const convertedSrts = [];
-
-  // Always attempt to split every subtitle stream into its own MKV copy to preserve bitmap/ass tracks.
-  if (mkvExists) {
-    sendOffscreenLog('Inspecting MKV copy to preserve all subtitle streams...', 'info', messageId);
-    try {
-      const maxTracks = 32;
-      for (let i = 0; i < maxTracks; i++) {
-        const trackNumber = i + 1;
-        const outName = formatExtractedName(trackNumber, 'mkv');
-        try {
-          await ffmpeg.run(
-            '-y',
-            '-analyzeduration', '60M',
-            '-probesize', '60M',
-            '-i', 'embedded_subs.mkv',
-            '-map', `0:s:${i}`,
-            '-c:s', 'copy',
-            outName
-          );
-          const data = ffmpeg.FS('readFile', outName);
-          if (data?.byteLength > 0) {
-            copiedTracks.push(outName);
-          } else {
-            try { ffmpeg.FS('unlink', outName); } catch (_) { }
-            break; // no more subtitle streams
-          }
-        } catch (innerErr) {
-          try { ffmpeg.FS('unlink', outName); } catch (_) { }
-          break; // stop at first missing stream
-        }
-      }
-      sendOffscreenLog(`Remuxed ${copiedTracks.length} subtitle stream(s) to MKV copy (kept internal)`, 'info', messageId);
-    } catch (probeErr) {
-      sendOffscreenLog(`Failed to remux MKV copy: ${probeErr?.message || probeErr}`, 'error', messageId);
+  if (!copiedTracks.length && !files.length) {
+    if (plannedTextStreams.length) {
+      sendOffscreenLog(
+        `Detected ${plannedTextStreams.length} text subtitle stream(s) in the container, but FFmpeg could not extract or copy them.`,
+        'error',
+        messageId
+      );
+      throw new Error('Text subtitle streams were detected, but FFmpeg could not extract them.');
     }
+    const advertisedSubtitles = (mkvProbe?.subtitleTracks?.length || 0) + (mkvProbe?.subtitleAttachments?.length || 0);
+    if (!advertisedSubtitles) {
+      sendOffscreenLog('FFmpeg found no subtitle streams and the MKV header probe found none.', 'warn', messageId);
+      throw new Error('No subtitle streams found in media.');
+    }
+    sendOffscreenLog(`No extracted text tracks were produced, but the MKV header probe advertised ${advertisedSubtitles} subtitle item(s). The current buffer likely does not contain enough subtitle packets yet.`, 'warn', messageId);
+    throw new Error('Subtitle tracks were advertised in the MKV header, but no extractable subtitle packets were present in the current buffer.');
   }
 
   // Try to convert each copied track to SRT if we don't already have an SRT for that index
@@ -1834,7 +2034,7 @@ async function demuxSubtitles(buffer, messageId) {
           try { ffmpeg.FS('unlink', srtName); } catch (_) { }
         }
       } catch (convErr) {
-        try { ffmpeg.FS('unlink', srtName); } catch (_) { }
+        cleanupFsFile(ffmpeg, srtName);
         sendOffscreenLog(`Failed to convert ${copyName} to SRT: ${convErr?.message || convErr}`, 'warn', messageId);
       }
     }
@@ -1846,6 +2046,14 @@ async function demuxSubtitles(buffer, messageId) {
 
   if (!files.length) {
     if (copiedTracks.length) {
+      if (plannedTextStreams.length) {
+        sendOffscreenLog(
+          `Detected ${plannedTextStreams.length} text subtitle stream(s) in the container, but FFmpeg produced no SRT output. Skipping OCR because this is not a bitmap-only stream.`,
+          'error',
+          messageId
+        );
+        throw new Error('Text subtitle streams were detected, but FFmpeg could not extract them to SRT.');
+      }
       let ocrTracks = [];
       try {
         ocrTracks = await runPaddleOcrOnCopiedTracks(ffmpeg, copiedTracks, messageId);
@@ -1930,28 +2138,24 @@ async function demuxSubtitles(buffer, messageId) {
           try { ffmpeg.FS('unlink', f); } catch (_) { }
         }
       }
-      const fixPattern = `${EXTRACTED_PREFIX}_fix_%02d.srt`;
-      await ffmpeg.run(
-        '-y',
-        '-fflags', '+genpts',
-        '-copyts',
-        '-start_at_zero',
-        '-analyzeduration', '60M',
-        '-probesize', '60M',
-        '-i', inputName,
-        '-map', '0:s?',
-        '-c:s', 'srt',
-        '-fix_sub_duration',
-        '-avoid_negative_ts', 'make_zero',
-        '-max_interleave_delta', '0',
-        '-muxpreload', '0',
-        '-muxdelay', '0',
-        '-start_number', '1',
-        fixPattern
-      );
-      const fixedFiles = ffmpeg.FS('readdir', '/')
-        .filter(f => EXTRACTED_FIX_PATTERN.test(f))
-        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+      const fixedFiles = await extractSubtitleTextTracks(ffmpeg, inputName, messageId, {
+        ...(plannedTextStreams.length ? { streamPlans: plannedTextStreams } : {}),
+        variant: 'fix',
+        inputArgs: [
+          '-fflags', '+genpts',
+          '-copyts',
+          '-start_at_zero',
+          '-analyzeduration', '60M',
+          '-probesize', '60M'
+        ],
+        outputArgs: [
+          '-fix_sub_duration',
+          '-avoid_negative_ts', 'make_zero',
+          '-max_interleave_delta', '0',
+          '-muxpreload', '0',
+          '-muxdelay', '0'
+        ]
+      });
       if (fixedFiles.length) {
         const fixedTracks = fixedFiles.map((file) => {
           const data = ffmpeg.FS('readFile', file);
@@ -1987,9 +2191,13 @@ async function demuxSubtitles(buffer, messageId) {
     sendOffscreenLog('Timelines still broken after PTS normalization; trying per-stream remux...', 'warn', messageId);
     try {
       const remuxed = [];
-      const maxStreams = 32;
-      for (let i = 0; i < maxStreams; i++) {
-        const outName = `remux_sub_${String(i).padStart(2, '0')}.mkv`;
+      const remuxTargets = plannedTextStreams.length
+        ? plannedTextStreams
+        : getSubtitleExtractionTargets({});
+      for (const target of remuxTargets) {
+        const streamIndex = target.streamIndex;
+        const outputIndex = target.outputIndex;
+        const outName = `remux_sub_${String(outputIndex - 1).padStart(2, '0')}.mkv`;
         try {
           await ffmpeg.run(
             '-y',
@@ -1998,7 +2206,7 @@ async function demuxSubtitles(buffer, messageId) {
             '-copyts',
             '-avoid_negative_ts', 'make_zero',
             '-i', inputName,
-            '-map', `0:s:${i}`,
+            '-map', `0:s:${streamIndex}`,
             '-c:s', 'copy',
             outName
           );
@@ -2073,13 +2281,10 @@ async function demuxSubtitles(buffer, messageId) {
 
   // Best-effort cleanup to avoid FS bloat across runs
   try {
-    for (const file of files) ffmpeg.FS('unlink', file);
-    ffmpeg.FS('unlink', inputName);
+    for (const file of files) cleanupFsFile(ffmpeg, file);
+    cleanupFsFile(ffmpeg, inputName);
     for (const copyName of copiedTracks) {
-      try { ffmpeg.FS('unlink', copyName); } catch (_) { /* ignore */ }
-    }
-    if (mkvExists) {
-      try { ffmpeg.FS('unlink', 'embedded_subs.mkv'); } catch (_) { }
+      cleanupFsFile(ffmpeg, copyName);
     }
   } catch (_) { /* ignore */ }
   const copyNote = skippedCopies ? `; omitted ${skippedCopies} MKV copy track(s) from output` : '';
@@ -2118,18 +2323,47 @@ async function extractSubtitlesViaVideo(streamUrl, mode, messageId) {
     let metadataLoaded = false;
     let cleanupDone = false;
     let retriedAnonymous = false;
+    let settled = false;
+    let cancelPoll = null;
+    const pendingTimers = new Set();
+
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+
+    const scheduleTimer = (fn, ms) => {
+      const timer = setTimeout(() => {
+        pendingTimers.delete(timer);
+        fn();
+      }, ms);
+      pendingTimers.add(timer);
+      return timer;
+    };
+
+    const abortIfRequested = () => {
+      try {
+        throwIfOffscreenJobAborted(messageId);
+        return false;
+      } catch (err) {
+        sendOffscreenLog(`Video extraction cancelled: ${err?.message || err}`, 'warn', messageId);
+        finish(reject, err);
+        return true;
+      }
+    };
 
     const timeout = setTimeout(() => {
       if (!cleanupDone) {
-        cleanup();
         const msg = tracks.length > 0
           ? `Extraction timed out but found ${tracks.length} track(s)`
           : 'Extraction timed out - no tracks found';
         sendOffscreenLog(msg, tracks.length > 0 ? 'warn' : 'error', messageId);
         if (tracks.length > 0) {
-          resolve(tracks);
+          finish(resolve, tracks);
         } else {
-          reject(new Error('Video subtitle extraction timed out'));
+          finish(reject, new Error('Video subtitle extraction timed out'));
         }
       }
     }, 120000);
@@ -2138,6 +2372,16 @@ async function extractSubtitlesViaVideo(streamUrl, mode, messageId) {
       if (cleanupDone) return;
       cleanupDone = true;
       clearTimeout(timeout);
+      if (cancelPoll) clearInterval(cancelPoll);
+      for (const timer of pendingTimers) {
+        clearTimeout(timer);
+      }
+      pendingTimers.clear();
+      try {
+        for (let i = 0; i < (video.textTracks?.length || 0); i++) {
+          video.textTracks[i].mode = 'disabled';
+        }
+      } catch (_) { /* ignore */ }
       video.pause();
       video.src = '';
       video.load();
@@ -2176,19 +2420,34 @@ async function extractSubtitlesViaVideo(streamUrl, mode, messageId) {
 
     function extractTrackContent(track, trackIndex) {
       return new Promise((resolveTrack) => {
+        let trackSettled = false;
+        let fallbackTimer = null;
+        const finishTrack = (value) => {
+          if (trackSettled) return;
+          trackSettled = true;
+          if (fallbackTimer) {
+            clearTimeout(fallbackTimer);
+            pendingTimers.delete(fallbackTimer);
+          }
+          resolveTrack(value);
+        };
         const trackObj = video.textTracks[trackIndex];
         if (!trackObj) {
           sendOffscreenLog(`Track ${trackIndex} not accessible`, 'warn', messageId);
-          resolveTrack(null);
+          finishTrack(null);
           return;
         }
 
         const handleCueChange = () => {
+          if (settled || cleanupDone) {
+            finishTrack(null);
+            return;
+          }
           try {
             const cues = Array.from(trackObj.cues || []);
             if (cues.length === 0) {
               sendOffscreenLog(`Track ${trackIndex} loaded but has no cues`, 'warn', messageId);
-              resolveTrack(null);
+              finishTrack(null);
               return;
             }
 
@@ -2201,7 +2460,7 @@ async function extractSubtitlesViaVideo(streamUrl, mode, messageId) {
             const langFromContent = detectLanguageFromContent(content);
             const language = langFromTrack || langFromContent || langGuess || 'und';
 
-            resolveTrack({
+            finishTrack({
               id: String(trackIndex + 1),
               label: track.label || trackObj.label || `Track ${trackIndex + 1}`,
               language,
@@ -2212,7 +2471,7 @@ async function extractSubtitlesViaVideo(streamUrl, mode, messageId) {
             });
           } catch (err) {
             sendOffscreenLog(`Failed to extract track ${trackIndex}: ${err?.message || err}`, 'error', messageId);
-            resolveTrack(null);
+            finishTrack(null);
           } finally {
             trackObj.removeEventListener('cuechange', handleCueChange);
             trackObj.mode = 'disabled';
@@ -2225,24 +2484,35 @@ async function extractSubtitlesViaVideo(streamUrl, mode, messageId) {
 
         // If cues are already loaded, trigger immediately
         if (trackObj.cues && trackObj.cues.length > 0) {
-          setTimeout(handleCueChange, 100);
+          fallbackTimer = scheduleTimer(handleCueChange, 100);
         } else {
           // Set a fallback timeout for this specific track
-          setTimeout(() => {
+          fallbackTimer = scheduleTimer(() => {
+            if (settled || cleanupDone) {
+              finishTrack(null);
+              return;
+            }
             if (trackObj.cues && trackObj.cues.length > 0) {
               handleCueChange();
             } else {
               sendOffscreenLog(`Track ${trackIndex} timed out without loading cues`, 'warn', messageId);
               trackObj.removeEventListener('cuechange', handleCueChange);
-              resolveTrack(null);
+              finishTrack(null);
             }
           }, 30000);
         }
       });
     }
 
+    if (abortIfRequested()) {
+      return;
+    }
+    cancelPoll = setInterval(() => {
+      abortIfRequested();
+    }, 250);
+
     video.addEventListener('loadedmetadata', async () => {
-      if (metadataLoaded) return;
+      if (metadataLoaded || settled || abortIfRequested()) return;
       metadataLoaded = true;
 
       sendOffscreenLog(`Video metadata loaded - duration: ${Math.round(video.duration)}s, ${video.videoWidth}x${video.videoHeight}`, 'info', messageId);
@@ -2274,8 +2544,7 @@ async function extractSubtitlesViaVideo(streamUrl, mode, messageId) {
         sendOffscreenLog('No text tracks found - video.textTracks is empty', 'warn', messageId);
         sendOffscreenLog('IMPORTANT: video.textTracks only exposes tracks added via <track> HTML elements, NOT embedded subtitle streams in the video container (MKV/MP4)', 'warn', messageId);
         sendOffscreenLog('This is expected behavior - FFmpeg fallback will extract embedded streams', 'info', messageId);
-        cleanup();
-        reject(new Error('No embedded subtitle tracks found in video'));
+        finish(reject, new Error('No embedded subtitle tracks found in video'));
         return;
       }
 
@@ -2288,27 +2557,26 @@ async function extractSubtitlesViaVideo(streamUrl, mode, messageId) {
         trackPromises.push(extractTrackContent(track, i));
       }
 
-        try {
-          const results = await Promise.all(trackPromises);
-          const validTracks = results.filter(t => t !== null);
+      try {
+        const results = await Promise.all(trackPromises);
+        if (settled || abortIfRequested()) return;
+        const validTracks = results.filter(t => t !== null);
 
-          if (validTracks.length === 0) {
-            cleanup();
-            reject(new Error('Failed to extract any subtitle content from tracks'));
-            return;
-          }
-
-          sendOffscreenLog(`Successfully extracted ${validTracks.length}/${tracksExpected} track(s)`, 'info', messageId);
-          const namedTracks = normalizeExtractedTracks(validTracks);
-          cleanup();
-          resolve(namedTracks);
-        } catch (err) {
-          cleanup();
-          reject(err);
+        if (validTracks.length === 0) {
+          finish(reject, new Error('Failed to extract any subtitle content from tracks'));
+          return;
         }
-      });
+
+        sendOffscreenLog(`Successfully extracted ${validTracks.length}/${tracksExpected} track(s)`, 'info', messageId);
+        const namedTracks = normalizeExtractedTracks(validTracks);
+        finish(resolve, namedTracks);
+      } catch (err) {
+        finish(reject, err);
+      }
+    });
 
     video.addEventListener('error', (e) => {
+      if (settled || abortIfRequested()) return;
       const error = video.error;
       let errorDetails = 'Unknown error';
       if (error) {
@@ -2339,8 +2607,7 @@ async function extractSubtitlesViaVideo(streamUrl, mode, messageId) {
           // fall through to failure
         }
       }
-      cleanup();
-      reject(new Error(msg));
+      finish(reject, new Error(msg));
     });
 
     // Add event listeners for tracking video load progress
@@ -2418,8 +2685,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  if (message?.type === 'OFFSCREEN_CANCEL') {
+    const aborted = markOffscreenJobAborted(message?.messageId, message?.reason || 'Operation cancelled');
+    if (message?.transferId) {
+      _chunkedBuffers.delete(message.transferId);
+    }
+    try { sendResponse?.({ ok: true, aborted }); } catch (_) { }
+    return false;
+  }
+
   if (message?.type === 'OFFSCREEN_FFMPEG_EXTRACT') {
     const requestId = message?.messageId;
+    beginOffscreenJob(requestId);
     console.log('[Offscreen] Handling OFFSCREEN_FFMPEG_EXTRACT', {
       requestId,
       hasBuffer: !!message?.buffer,
@@ -2455,6 +2732,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         let incomingBuffer = message?.buffer;
         const transferId = message?.transferId || (incomingBuffer && incomingBuffer.transferId);
+        throwIfOffscreenJobAborted(requestId);
 
         if (message?.transferMethod === 'idb' && transferId) {
           try {
@@ -2474,6 +2752,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           incomingBuffer = consumeChunkedBuffer(incomingBuffer.transferId);
         }
         if (!incomingBuffer) throw new Error('Missing buffer in offscreen request');
+        throwIfOffscreenJobAborted(requestId);
         const sizeMb = Math.round(((incomingBuffer?.byteLength || incomingBuffer?.size || 0) / (1024 * 1024)) * 10) / 10;
         sendOffscreenLog(`Received demux request (job ${requestId || 'n/a'}), size: ${sizeMb} MB`, 'info', requestId);
         sendOffscreenLog(`Offscreen env: SAB=${typeof SharedArrayBuffer !== 'undefined' ? 'yes' : 'no'}, COI=${self.crossOriginIsolated === false ? 'no' : 'yes'}`, 'info', requestId);
@@ -2482,12 +2761,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           90000,
           `FFmpeg demux timed out in offscreen page${requestId ? ` (job ${requestId})` : ''}`
         );
+        throwIfOffscreenJobAborted(requestId);
         const prepared = await prepareTracksForSend(tracks, requestId);
+        throwIfOffscreenJobAborted(requestId);
         respond({ success: true, tracks: prepared.tracks, chunked: prepared.chunked });
       } catch (err) {
-        console.error('[Offscreen] Extraction failed:', err);
-        sendOffscreenLog(`Demux failed: ${err?.message || err}`, 'error', requestId);
+        const level = isAbortError(err) ? 'warn' : 'error';
+        console[level === 'error' ? 'error' : 'warn']('[Offscreen] Extraction failed:', err);
+        sendOffscreenLog(`Demux failed: ${err?.message || err}`, level, requestId);
         respond({ success: false, error: err?.message || String(err) });
+      } finally {
+        finishOffscreenJob(requestId);
       }
     })();
     return true; // async
@@ -2495,6 +2779,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === 'OFFSCREEN_FFMPEG_DECODE') {
     const requestId = message?.messageId;
+    beginOffscreenJob(requestId);
     console.log('[Offscreen] Handling OFFSCREEN_FFMPEG_DECODE', {
       requestId,
       windowCount: Array.isArray(message?.windows) ? message.windows.length : 0,
@@ -2551,6 +2836,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (!rawWindows.length) {
           throw new Error('No audio windows provided for decode');
         }
+        throwIfOffscreenJobAborted(requestId);
 
         // Some decode requests reuse the same transferId across multiple windows to avoid
         // duplicating large buffers. Cache each loaded buffer so we only consume IDB/chunks once.
@@ -2593,6 +2879,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (!buf) {
             throw new Error(`Missing buffer for window ${idx + 1}`);
           }
+          throwIfOffscreenJobAborted(requestId);
           windows.push({
             buffer: buf instanceof Uint8Array ? buf : new Uint8Array(buf),
             startSec: w?.startSec,
@@ -2606,6 +2893,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           180000,
           `FFmpeg audio decode timed out${requestId ? ` (job ${requestId})` : ''}`
         );
+        throwIfOffscreenJobAborted(requestId);
         const safeWindows = cloneAudioWindows(decoded);
 
         const prepared = [];
@@ -2622,11 +2910,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
         }
 
+        throwIfOffscreenJobAborted(requestId);
         respond({ success: true, audioWindows: prepared, chunked: true });
       } catch (err) {
-        console.error('[Offscreen] Audio decode failed:', err);
-        sendOffscreenLog(`Audio decode failed: ${err?.message || err}`, 'error', requestId);
+        const level = isAbortError(err) ? 'warn' : 'error';
+        console[level === 'error' ? 'error' : 'warn']('[Offscreen] Audio decode failed:', err);
+        sendOffscreenLog(`Audio decode failed: ${err?.message || err}`, level, requestId);
         respond({ success: false, error: err?.message || String(err) });
+      } finally {
+        finishOffscreenJob(requestId);
       }
     })();
     return true;
@@ -2634,6 +2926,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === 'OFFSCREEN_VIDEO_EXTRACT') {
     const requestId = message?.messageId;
+    beginOffscreenJob(requestId);
     console.log('[Offscreen] Handling OFFSCREEN_VIDEO_EXTRACT', {
       requestId,
       streamUrl: message?.streamUrl?.substring(0, 80)
@@ -2673,6 +2966,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (!streamUrl) {
           throw new Error('Missing streamUrl for video extraction');
         }
+        throwIfOffscreenJobAborted(requestId);
 
         sendOffscreenLog(`Starting video-based extraction for ${streamUrl.substring(0, 60)}...`, 'info', requestId);
 
@@ -2682,12 +2976,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           `Video extraction timed out${requestId ? ` (job ${requestId})` : ''}`
         );
 
+        throwIfOffscreenJobAborted(requestId);
         const prepared = await prepareTracksForSend(tracks, requestId);
         respond({ success: true, tracks: prepared.tracks, chunked: prepared.chunked });
       } catch (err) {
-        console.error('[Offscreen] Video extraction failed:', err);
-        sendOffscreenLog(`Video extraction failed: ${err?.message || err}`, 'error', requestId);
+        const level = isAbortError(err) ? 'warn' : 'error';
+        console[level === 'error' ? 'error' : 'warn']('[Offscreen] Video extraction failed:', err);
+        sendOffscreenLog(`Video extraction failed: ${err?.message || err}`, level, requestId);
         respond({ success: false, error: err?.message || String(err) });
+      } finally {
+        finishOffscreenJob(requestId);
       }
     })();
     return true;

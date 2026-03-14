@@ -83,6 +83,7 @@ const MAX_EMBEDDED_EXTRACTS_PER_TAB = 1;
 const RESULT_CHUNK_TTL_MS = 5 * 60 * 1000;
 const ASSEMBLY_POLL_TIMEOUT_MS = 5 * 60 * 1000;
 const ASSEMBLY_POLL_INTERVAL_MS = 3000;
+const MAX_COMPLETE_IN_BROWSER_BYTES = 3 * 1024 * 1024 * 1024; // 3 GiB safety ceiling for full in-browser fetches
 
 function logOffscreenLifecycle(event, extra = {}) {
   console.log('[Background][Offscreen]', event, {
@@ -200,16 +201,115 @@ let activeExtractJobs = new Map();
 // Reset active stats on startup to prevent stuck "Syncing now" state
 chrome.storage.local.set({ activeSyncs: 0 }).catch(() => { });
 
-function cleanupExtractJobsForTab(tabId) {
-  if (!tabId) return 0;
-  let removed = 0;
-  activeExtractJobs.forEach((job, key) => {
-    if (job?.tabId === tabId) {
-      activeExtractJobs.delete(key);
-      removed += 1;
-    }
+function createAbortError(reason = 'Operation aborted') {
+  const message = typeof reason === 'string' && reason ? reason : 'Operation aborted';
+  const err = new Error(message);
+  err.name = 'AbortError';
+  return err;
+}
+
+function isAbortError(err) {
+  if (!err) return false;
+  return err.name === 'AbortError'
+    || err.code === 'ABORT_ERR'
+    || /aborted|cancelled|canceled/i.test(err?.message || '');
+}
+
+function throwIfAborted(signal, reason = 'Operation aborted') {
+  if (signal?.aborted) {
+    throw createAbortError(signal.reason || reason);
+  }
+}
+
+function waitWithAbort(ms, signal) {
+  if (!ms || ms <= 0) {
+    return Promise.resolve();
+  }
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  if (signal.aborted) {
+    return Promise.reject(createAbortError(signal.reason || 'Operation aborted'));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      fn(value);
+    };
+    const onAbort = () => finish(reject, createAbortError(signal.reason || 'Operation aborted'));
+    const timer = setTimeout(() => finish(resolve), ms);
+    signal.addEventListener('abort', onAbort, { once: true });
   });
-  return removed;
+}
+
+function requestOffscreenCancel(messageId, reason = 'Operation cancelled') {
+  if (!messageId) return;
+  try {
+    chrome.runtime.sendMessage({
+      type: 'OFFSCREEN_CANCEL',
+      messageId,
+      reason
+    }, () => {
+      void chrome.runtime?.lastError;
+    });
+  } catch (_) { /* ignore */ }
+}
+
+function createExtractJobRecord(tabId, messageId) {
+  let settle = () => { };
+  const settled = new Promise((resolve) => {
+    settle = resolve;
+  });
+  return {
+    tabId,
+    messageId,
+    startTime: Date.now(),
+    status: 'starting',
+    controller: new AbortController(),
+    abortReason: '',
+    settled,
+    settle,
+    terminalSent: false
+  };
+}
+
+function getExtractJob(messageId) {
+  return messageId ? activeExtractJobs.get(messageId) || null : null;
+}
+
+function getExtractJobSignal(messageId) {
+  return getExtractJob(messageId)?.controller?.signal || null;
+}
+
+function abortExtractJob(job, reason = 'Extraction cancelled') {
+  if (!job || job.controller?.signal?.aborted) {
+    return false;
+  }
+  job.status = 'aborting';
+  job.abortReason = reason || 'Extraction cancelled';
+  requestOffscreenCancel(job.messageId, job.abortReason);
+  try {
+    job.controller?.abort(job.abortReason);
+  } catch (_) {
+    job.controller?.abort();
+  }
+  return true;
+}
+
+async function abortExtractJobsForTab(tabId, reason = 'Extraction cancelled') {
+  if (!tabId) return { count: 0, jobs: [] };
+  const jobs = [...activeExtractJobs.values()].filter((job) => job?.tabId === tabId);
+  let count = 0;
+  for (const job of jobs) {
+    if (abortExtractJob(job, reason)) {
+      count += 1;
+    }
+  }
+  return { count, jobs };
 }
 
 const DEBUG_FLAG_KEY = 'debugLogsEnabled';
@@ -302,6 +402,7 @@ async function safeFetch(url, options = {}) {
   let lastErr = null;
   for (const attempt of attempts) {
     const attemptUrl = attempt.url || url;
+    throwIfAborted(attempt.opts?.signal, `Fetch aborted for ${attemptUrl}`);
     console.log('[Background] safeFetch attempt', {
       url: attemptUrl,
       attempt: attempt.label,
@@ -315,6 +416,9 @@ async function safeFetch(url, options = {}) {
       }
       return res;
     } catch (err) {
+      if (isAbortError(err)) {
+        throw err;
+      }
       lastErr = err;
       console.warn('[Background] Fetch attempt failed', {
         url: attemptUrl,
@@ -346,27 +450,65 @@ function mergeHeaders(base, extra) {
   return merged;
 }
 
+function formatByteCount(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let idx = 0;
+  let current = value;
+  while (current >= 1024 && idx < units.length - 1) {
+    current /= 1024;
+    idx += 1;
+  }
+  const rounded = current >= 100 || idx === 0 ? Math.round(current) : Math.round(current * 10) / 10;
+  return `${rounded} ${units[idx]}`;
+}
+
+function buildFullFetchPhaseError(url, res, phase, receivedBytes, totalBytes, err) {
+  if (isAbortError(err)) {
+    return err;
+  }
+  const host = (() => { try { return new URL(url).hostname; } catch (_) { return url || 'unknown host'; } })();
+  const detail = err?.message || String(err || 'unknown error');
+  const received = formatByteCount(receivedBytes || 0);
+  const total = totalBytes ? formatByteCount(totalBytes) : null;
+  const status = res?.status ? `HTTP ${res.status}` : null;
+  const parts = [`Full fetch ${phase} failed`, `after ${received}`];
+  if (total) parts.push(`of ${total}`);
+  parts.push(`from ${host}`);
+  if (status) parts.push(`(${status})`);
+  const wrapped = new Error(`${parts.join(' ')}: ${detail}`);
+  if (err?.stack) {
+    wrapped.stack = err.stack;
+  }
+  return wrapped;
+}
+
 async function fetchWithBackoff(url, opts, retries = 4, delayMs = 1500) {
   let attempt = 0;
   let lastRes = null;
   let lastErr = null;
   while (attempt <= retries) {
     try {
+      throwIfAborted(opts?.signal, `Fetch aborted for ${url}`);
       const res = await safeFetch(url, opts);
       lastRes = res;
       if (res.ok || res.status === 206) return res;
       if (res.status === 429 && attempt < retries) {
         const backoff = delayMs * (attempt + 1);
-        await new Promise(r => setTimeout(r, backoff + Math.floor(Math.random() * 400)));
+        await waitWithAbort(backoff + Math.floor(Math.random() * 400), opts?.signal);
         attempt += 1;
         continue;
       }
       return res;
     } catch (err) {
+      if (isAbortError(err)) {
+        throw err;
+      }
       lastErr = err;
       if (attempt >= retries) throw err;
       const backoff = delayMs * (attempt + 1);
-      await new Promise(r => setTimeout(r, backoff + Math.floor(Math.random() * 300)));
+      await waitWithAbort(backoff + Math.floor(Math.random() * 300), opts?.signal);
       attempt += 1;
     }
   }
@@ -406,64 +548,6 @@ async function importScriptSafe(url, label = '') {
 /**
  * Ensure FFmpeg factory (createFFmpeg) is available without depending on CDN.
  */
-async function ensureFfmpegFactory() {
-  const wireUpWasmShim = () => {
-    if (!self.createFFmpeg && self.FFmpegWASM?.FFmpeg) {
-      // Some builds expose FFmpeg under FFmpegWASM only; create a compatible factory.
-      self.FFmpeg = self.FFmpegWASM;
-      self.createFFmpeg = (opts = {}) => new self.FFmpegWASM.FFmpeg(opts);
-    }
-    return self.createFFmpeg || (self.FFmpeg && self.FFmpeg.createFFmpeg);
-  };
-
-  let factory = self.createFFmpeg || (self.FFmpeg && self.FFmpeg.createFFmpeg) || wireUpWasmShim();
-  if (factory) return factory;
-
-  const tryLoad = async (url, label) => {
-    if (!url) return;
-    try {
-      const canUseImportScripts = typeof importScripts === 'function' && (url.startsWith('chrome-extension://') || url.startsWith('assets/lib/'));
-      if (canUseImportScripts) {
-        // Some ffmpeg builds expect DOM globals; stub minimal document/window for worker context.
-        if (typeof document === 'undefined' || !self.document) {
-          self.document = { baseURI: self.location?.href || '', currentScript: null };
-        }
-        if (typeof window === 'undefined' || !self.window) {
-          self.window = self;
-        }
-        await importScriptSafe(url, label || url);
-      } else {
-        if (typeof document === 'undefined' && !self.document) {
-          // Some FFmpeg builds expect document to exist; stub it for worker context.
-          self.document = { baseURI: self.location?.href || '', currentScript: null };
-        }
-        await importScriptSafe(url, label || url);
-      }
-      factory = self.createFFmpeg || (self.FFmpeg && self.FFmpeg.createFFmpeg) || wireUpWasmShim();
-      if (factory) {
-        console.log(`[Background] FFmpeg loader ready via ${label}`);
-      }
-    } catch (err) {
-      console.warn(`[Background] Failed to load FFmpeg loader from ${label}:`, err?.message || err);
-    }
-  };
-
-  // Prefer bundled loader (works in module service workers too).
-  if (chrome?.runtime?.getURL) {
-    await tryLoad(chrome.runtime.getURL('assets/lib/ffmpeg.js'), 'bundled ffmpeg.js');
-  }
-
-  if (!factory && typeof importScripts === 'function') {
-    await tryLoad('assets/lib/ffmpeg.js', 'importScripts(ffmpeg.js)');
-  }
-
-  if (!factory) {
-    throw new Error('FFmpeg loader unavailable. Ensure assets/lib/ffmpeg.js is bundled with the extension.');
-  }
-
-  return factory;
-}
-
 async function ensureTransferHelper() {
   if (self.SubMakerTransfer) return self.SubMakerTransfer;
   if (_transferHelperError) {
@@ -1717,10 +1801,17 @@ function __xsyncHandleMessage(message, sender, sendResponse) {
     });
 
     if (message?.type === 'RESET_EMBEDDED_PAGE') {
-      const cleared = cleanupExtractJobsForTab(sender?.tab?.id);
-      forceCloseOffscreenDocument(message?.reason || 'page-reset')
-        .catch(() => { })
-        .finally(() => reply({ success: true, cleared }));
+      abortExtractJobsForTab(sender?.tab?.id, `Extraction cancelled (${message?.reason || 'page-reset'})`)
+        .then(async ({ count, jobs }) => {
+          const hasOtherActiveJobs = [...activeExtractJobs.values()].some((job) => job && job.tabId !== sender?.tab?.id);
+          if (!hasOtherActiveJobs && jobs.length) {
+            await forceCloseOffscreenDocument(message?.reason || 'page-reset').catch(() => { });
+          } else {
+            scheduleOffscreenCleanup(250);
+          }
+          reply({ success: true, cleared: count });
+        })
+        .catch(() => reply({ success: true, cleared: 0 }));
       return true;
     }
 
@@ -2072,7 +2163,15 @@ async function handleExtractSubsRequest(message, tabId, mode) {
   const baseHeaders = mergeHeaders(null, message?.pageHeaders || null);
 
   console.log('[Background] Starting extraction job:', { messageId, streamUrl: streamUrl?.substring(0, 60), mode: normalizedMode });
-  const activeForTab = tabId ? [...activeExtractJobs.values()].filter((job) => job?.tabId === tabId).length : 0;
+  const activeJobsForTab = tabId ? [...activeExtractJobs.values()].filter((job) => job?.tabId === tabId) : [];
+  const activeForTab = activeJobsForTab.length;
+  const abortingForTab = activeJobsForTab.some((job) => job?.status === 'aborting');
+  if (abortingForTab) {
+    const err = 'A previous embedded extraction is still stopping. Wait a moment and retry.';
+    sendExtractProgress(tabId, messageId, 100, err);
+    sendExtractResult(tabId, messageId, { success: false, error: err });
+    return { success: false, error: err };
+  }
   if (activeForTab >= MAX_EMBEDDED_EXTRACTS_PER_TAB) {
     const err = 'Only one embedded extraction is allowed per tab. Wait for the current run to finish.';
     sendExtractProgress(tabId, messageId, 100, err);
@@ -2086,10 +2185,12 @@ async function handleExtractSubsRequest(message, tabId, mode) {
     return { success: false, error: err };
   }
 
-  activeExtractJobs.set(messageId, { tabId, messageId, startTime: Date.now(), status: 'starting' });
+  const job = createExtractJobRecord(tabId, messageId);
+  activeExtractJobs.set(messageId, job);
   let resolution = null;
 
   try {
+    throwIfAborted(job.controller.signal, 'Extraction cancelled');
     sendExtractProgress(tabId, messageId, 3, 'Validating stream URL...');
     console.log('[Background] Validating URL...');
     if (!isHttpUrl(streamUrl)) {
@@ -2097,27 +2198,41 @@ async function handleExtractSubsRequest(message, tabId, mode) {
     }
 
     console.log('[Background] Resolving stream URL...');
-    resolution = await resolveStreamUrl(streamUrl, tabId, messageId);
+    job.status = 'resolving';
+    resolution = await resolveStreamUrl(streamUrl, tabId, messageId, { signal: job.controller.signal, headers: baseHeaders });
     console.log('[Background] Stream resolved:', { streamUrl: resolution.streamUrl?.substring(0, 60), isHls: resolution.isHls, isDash: resolution.isDash });
 
+    throwIfAborted(job.controller.signal, 'Extraction cancelled');
     sendExtractProgress(tabId, messageId, 10, 'Fetching stream...');
     console.log('[Background] Calling extractEmbeddedSubtitles...');
-    const tracks = await extractEmbeddedSubtitles(resolution.streamUrl, normalizedMode, tabId, messageId, { ...resolution, pageHeaders: message.pageHeaders || null });
+    job.status = 'extracting';
+    const tracks = await extractEmbeddedSubtitles(resolution.streamUrl, normalizedMode, tabId, messageId, {
+      ...resolution,
+      pageHeaders: message.pageHeaders || null,
+      signal: job.controller.signal
+    });
+    throwIfAborted(job.controller.signal, 'Extraction cancelled');
     console.log('[Background] Extraction successful, found', tracks?.length, 'tracks', { durationMs: Date.now() - startedAt });
     sendExtractProgress(tabId, messageId, 100, 'Extraction complete');
+    job.status = 'completed';
     const result = { success: true, tracks };
     sendExtractResult(tabId, messageId, result);
+    job.terminalSent = true;
     return result;
   } catch (error) {
+    const aborted = isAbortError(error) || job.controller.signal.aborted;
     console.error('[Background] Extraction failed:', error, { durationMs: Date.now() - startedAt });
     console.error('[Background] Error details:', {
       message: error.message,
       stack: error.stack,
       name: error.name
     });
-    sendDebugLog(tabId, messageId, `Extraction failed: ${error.message || error}`, 'error');
-    const errorMsg = error.message || 'Extraction failed';
-    sendExtractProgress(tabId, messageId, 100, 'Extraction failed: ' + errorMsg);
+    const logLevel = aborted ? 'warn' : 'error';
+    sendDebugLog(tabId, messageId, `Extraction failed: ${error.message || error}`, logLevel);
+    const errorMsg = aborted
+      ? (job.abortReason || error.message || 'Extraction cancelled')
+      : (error.message || 'Extraction failed');
+    sendExtractProgress(tabId, messageId, 100, aborted ? errorMsg : ('Extraction failed: ' + errorMsg));
     const resolutionHost = (() => {
       try { return new URL(resolution?.streamUrl || streamUrl || '').hostname; } catch (_) { return resolution?.streamUrl || streamUrl || ''; }
     })();
@@ -2125,9 +2240,12 @@ async function handleExtractSubsRequest(message, tabId, mode) {
       success: false,
       error: `${errorMsg}${resolutionHost ? ` (stream host: ${resolutionHost})` : ''}`
     };
+    job.status = aborted ? 'aborted' : 'failed';
     sendExtractResult(tabId, messageId, result);
+    job.terminalSent = true;
     return result;
   } finally {
+    job.settle?.();
     activeExtractJobs.delete(messageId);
     if (!activeExtractJobs.size) {
       await forceCloseOffscreenDocument('extract-finished');
@@ -3364,17 +3482,19 @@ async function synchronizeSubtitle(audioBlob, subtitleContent, mode, onProgress,
  * Extract embedded subtitle streams using FFmpeg (client-side).
  * Falls back to direct SRT/VTT fetch when possible.
  */
-async function resolveStreamUrl(streamUrl, tabId, messageId) {
+async function resolveStreamUrl(streamUrl, tabId, messageId, options = {}) {
   const original = String(streamUrl || '');
   let resolvedUrl = original;
   let contentType = '';
   let isHls = /\.m3u8(\?|$)/i.test(original);
   let isDash = /\.mpd(\?|$)/i.test(original);
   const upgradeToHttpsHosts = ['download.real-debrid.com', 'real-debrid.com', 'torrentio.strem.fun', 'strem.fun'];
+  const signal = options?.signal || null;
+  const headers = options?.headers || null;
 
   try {
     sendExtractProgress(tabId, messageId, 5, 'Resolving stream (following redirects)...');
-    const resp = await safeFetch(original, { redirect: 'follow' });
+    const resp = await safeFetch(original, { redirect: 'follow', ...(headers ? { headers } : {}), ...(signal ? { signal } : {}) });
     contentType = resp.headers.get('content-type') || '';
 
     // Try JSON resolvers (e.g., torrentio resolve)
@@ -3417,16 +3537,18 @@ async function resolveStreamUrl(streamUrl, tabId, messageId) {
 
     sendExtractProgress(tabId, messageId, 9, `Using stream: ${new URL(resolvedUrl).hostname}`);
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.warn('[Background] Resolve step failed, continuing with original URL:', err?.message);
   }
 
   return { streamUrl: resolvedUrl, contentType, isHls, isDash };
 }
 
-async function tryExtractDashTextTracks(mpdUrl, tabId, messageId) {
+async function tryExtractDashTextTracks(mpdUrl, tabId, messageId, options = {}) {
+  const signal = options?.signal || null;
   try {
     sendExtractProgress(tabId, messageId, 12, 'Parsing DASH manifest for text tracks...');
-    const text = await (await safeFetch(mpdUrl)).text();
+    const text = await (await safeFetch(mpdUrl, { signal })).text();
     const tracks = [];
 
     const baseMatch = text.match(/<BaseURL>([^<]+)<\/BaseURL>/i);
@@ -3455,10 +3577,10 @@ async function tryExtractDashTextTracks(mpdUrl, tabId, messageId) {
         if (!url) continue;
         const abs = new URL(url, mpdUrl).toString();
         if (abs.endsWith('.vtt') || abs.includes('.vtt?')) {
-          const vtt = await (await safeFetch(abs)).text();
+          const vtt = await (await safeFetch(abs, { signal })).text();
           tracks.push({ id: String(tracks.length), label: repBase || repLabel || 'DASH VTT', language: repLang, codec: 'vtt', content: convertVttToSrt(vtt) });
         } else if (abs.endsWith('.srt') || abs.includes('.srt?')) {
-          const srt = await (await safeFetch(abs)).text();
+          const srt = await (await safeFetch(abs, { signal })).text();
           tracks.push({ id: String(tracks.length), label: repBase || repLabel || 'DASH SRT', language: repLang, codec: 'srt', content: srt });
         }
       }
@@ -3469,6 +3591,7 @@ async function tryExtractDashTextTracks(mpdUrl, tabId, messageId) {
       return applyContentLanguageGuesses(tracks);
     }
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.warn('[Background] DASH text track parse failed:', err?.message);
   }
   return null;
@@ -3482,7 +3605,9 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
   const hostLabel = (() => { try { return new URL(streamUrl).hostname; } catch (_) { return streamUrl; } })();
   const extractionMode = normalizedMode;
   const baseHeaders = mergeHeaders(null, hints?.pageHeaders || null);
+  const signal = hints?.signal || getExtractJobSignal(messageId);
   console.log('[Background] extractEmbeddedSubtitles for host:', hostLabel, 'mode:', extractionMode);
+  throwIfAborted(signal, 'Extraction cancelled');
   const applyLangHints = (tracks, langHints) => {
     const withHints = (!langHints || !langHints.length)
       ? (tracks || [])
@@ -3492,12 +3617,12 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
 
   // Simple path: direct subtitle file
   if (lowerUrl.endsWith('.srt') || lowerUrl.includes('.srt?')) {
-    const text = await (await safeFetch(streamUrl, baseHeaders ? { headers: baseHeaders } : undefined)).text();
+    const text = await (await safeFetch(streamUrl, { ...(baseHeaders ? { headers: baseHeaders } : {}), ...(signal ? { signal } : {}) })).text();
     const langGuess = detectLanguageFromContent(text) || 'und';
     return [{ id: '0', label: 'Subtitle file', language: langGuess, codec: 'srt', content: text }];
   }
   if (lowerUrl.endsWith('.vtt') || lowerUrl.includes('.vtt?')) {
-    const text = await (await safeFetch(streamUrl, baseHeaders ? { headers: baseHeaders } : undefined)).text();
+    const text = await (await safeFetch(streamUrl, { ...(baseHeaders ? { headers: baseHeaders } : {}), ...(signal ? { signal } : {}) })).text();
     const asSrt = convertVttToSrt(text);
     const langGuess = detectLanguageFromContent(asSrt) || 'und';
     return [{ id: '0', label: 'WebVTT file', language: langGuess, codec: 'vtt', content: asSrt }];
@@ -3507,7 +3632,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
   const isDash = hints.isDash === true || /\.mpd(\?|$)/i.test(lowerUrl);
 
   if (isDash) {
-    const dashTracks = await tryExtractDashTextTracks(streamUrl, tabId, messageId);
+    const dashTracks = await tryExtractDashTextTracks(streamUrl, tabId, messageId, { signal });
     if (dashTracks && dashTracks.length) {
       return dashTracks;
     }
@@ -3547,12 +3672,13 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
     if (isHls) {
       sendExtractProgress(tabId, messageId, 4, `${modeLabel}: loading text tracks via video element...`);
       try {
-        const videoTracks = applyLangHints(await extractSubtitlesViaVideoOffscreen(streamUrl, extractionMode, messageId, tabId));
+        const videoTracks = applyLangHints(await extractSubtitlesViaVideoOffscreen(streamUrl, extractionMode, messageId, tabId, { signal }));
         const { summary } = evaluateTracks(videoTracks, null, false, 'video extraction');
         const lastCueText = summary?.lastCueSec ? `; last cue at ${Math.round(summary.lastCueSec)}s` : '';
         sendExtractProgress(tabId, messageId, 100, `${modeLabel}: extracted ${videoTracks.length} track(s) via video${lastCueText}`);
         return videoTracks;
       } catch (vErr) {
+        if (isAbortError(vErr)) throw vErr;
         const reason = vErr?.message || vErr;
         sendDebugLog(tabId, messageId, `${modeLabel} video extraction failed (${reason})`, 'warn');
         failSmart('video element path unavailable');
@@ -3567,9 +3693,11 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
         streamUrl,
         (p) => sendExtractProgress(tabId, messageId, Math.min(60, 5 + Math.round(p * 0.55)), `${modeLabel}: fetching sample from ${hostLabel}...`),
         { minBytes: 96 * 1024 * 1024, maxBytesCap: 320 * 1024 * 1024 },
-        baseHeaders
+        baseHeaders,
+        { signal }
       );
     } catch (sErr) {
+      if (isAbortError(sErr)) throw sErr;
       failSmart(`sample fetch failed (${sErr?.message || sErr})`);
     }
 
@@ -3579,28 +3707,99 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
     sendDebugLog(tabId, messageId, `${modeLabel}: sample ready (~${sampleMb} MB, partial=${sample?.partial ? 'yes' : 'no'})`, 'info');
     sendExtractProgress(tabId, messageId, 75, `${modeLabel}: demuxing sample...`);
     try {
-      const tracks = applyLangHints(await demuxSubtitlesOffscreen(buffer, messageId, tabId), sample?.subtitleLangs);
+      const tracks = applyLangHints(await demuxSubtitlesOffscreen(buffer, messageId, tabId, { signal }), sample?.subtitleLangs);
       const durationSec = sample?.durationSec || probeContainerDuration(buffer) || null;
       const { summary } = evaluateTracks(tracks, durationSec, sample?.partial === true, 'demux');
       const lastCueText = summary?.lastCueSec ? `; last cue at ${Math.round(summary.lastCueSec)}s` : '';
       sendExtractProgress(tabId, messageId, 100, `${modeLabel}: demuxed ${tracks.length} track(s)${lastCueText}`);
       return tracks;
     } catch (dErr) {
+      if (isAbortError(dErr)) throw dErr;
       failSmart(`demux failed (${dErr?.message || dErr})`);
     }
   }
 
   if (isCompleteMode) {
+    let completeProbe = null;
+    if (!isHls) {
+      try {
+        completeProbe = await fetchByteRangeSample(
+          streamUrl,
+          (p) => sendExtractProgress(tabId, messageId, Math.min(18, 4 + Math.round(p * 0.14)), `Complete: probing ${hostLabel} before full download...`),
+          { minBytes: 8 * 1024 * 1024, maxBytesCap: 8 * 1024 * 1024 },
+          baseHeaders,
+          { signal }
+        );
+        if (completeProbe?.totalBytes && completeProbe.totalBytes > MAX_COMPLETE_IN_BROWSER_BYTES) {
+          const totalLabel = formatByteCount(completeProbe.totalBytes);
+          sendDebugLog(
+            tabId,
+            messageId,
+            `Complete mode avoided a ${totalLabel} in-browser full download from ${hostLabel}; attempting range-based recovery instead.`,
+            'warn'
+          );
+          const recovered = await tryCompleteModeRangeRecovery({
+            streamUrl,
+            messageId,
+            tabId,
+            hostLabel,
+            baseHeaders,
+            initialSample: completeProbe
+          });
+          if (recovered?.tracks?.length) {
+            const tracks = applyLangHints(recovered.tracks, hints?.subtitleLangs);
+            const summary = summarizeTracks(tracks);
+            const lastCueText = summary?.lastCueSec ? `; last cue at ${Math.round(summary.lastCueSec)}s` : '';
+            sendExtractProgress(tabId, messageId, 100, `Complete: recovered ${tracks.length} track(s) via range-based fallback${lastCueText}`);
+            return tracks;
+          }
+          throw new Error(`Complete mode refused a ${totalLabel} in-browser full download from ${hostLabel}; range-based recovery did not find complete subtitles.`);
+        }
+      } catch (probeErr) {
+        const probeMsg = probeErr?.message || String(probeErr);
+        if (isAbortError(probeErr)) throw probeErr;
+        if (/refused a .* in-browser full download/i.test(probeMsg)) {
+          throw probeErr;
+        }
+        sendDebugLog(tabId, messageId, `Complete preflight probe failed (${probeMsg}); continuing with direct full download.`, 'warn');
+      }
+    }
+
     sendExtractProgress(tabId, messageId, 4, isHls ? 'Complete: downloading full HLS stream...' : 'Complete: downloading full stream...');
-    const full = isHls
-      ? await fetchFullHlsStream(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(92, 5 + Math.round(p * 0.87)), 'Complete: downloading full HLS stream...'), baseHeaders)
-      : await fetchFullStream(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(92, 5 + Math.round(p * 0.87)), 'Complete: downloading full stream...'), baseHeaders);
+    let full;
+    try {
+      full = isHls
+        ? await fetchFullHlsStream(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(92, 5 + Math.round(p * 0.87)), 'Complete: downloading full HLS stream...'), baseHeaders, { signal })
+        : await fetchFullStream(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(92, 5 + Math.round(p * 0.87)), 'Complete: downloading full stream...'), baseHeaders, { signal });
+    } catch (fullErr) {
+      if (isAbortError(fullErr)) throw fullErr;
+      if (!isHls) {
+        const fullMsg = fullErr?.message || String(fullErr);
+        sendDebugLog(tabId, messageId, `Complete full download failed (${fullMsg}); trying range-based recovery...`, 'warn');
+        const recovered = await tryCompleteModeRangeRecovery({
+          streamUrl,
+          messageId,
+          tabId,
+          hostLabel,
+          baseHeaders,
+          initialSample: completeProbe
+        });
+        if (recovered?.tracks?.length) {
+          const tracks = applyLangHints(recovered.tracks, hints?.subtitleLangs);
+          const summary = summarizeTracks(tracks);
+          const lastCueText = summary?.lastCueSec ? `; last cue at ${Math.round(summary.lastCueSec)}s` : '';
+          sendExtractProgress(tabId, messageId, 100, `Complete: recovered ${tracks.length} track(s) after full-download failure${lastCueText}`);
+          return tracks;
+        }
+      }
+      throw fullErr;
+    }
     const fullBuffer = full?.buffer || full;
     const fullBytes = fullBuffer?.byteLength || 0;
     const fullMb = Math.round((fullBytes / (1024 * 1024)) * 10) / 10;
     sendDebugLog(tabId, messageId, `Complete: fetched full stream (~${fullMb || '?'} MB). Demuxing...`, 'info');
     sendExtractProgress(tabId, messageId, 95, 'Complete: demuxing full stream...');
-    const tracks = applyLangHints(await demuxSubtitlesOffscreen(fullBuffer, messageId, tabId), full?.subtitleLangs || hints?.subtitleLangs);
+    const tracks = applyLangHints(await demuxSubtitlesOffscreen(fullBuffer, messageId, tabId, { signal }), full?.subtitleLangs || hints?.subtitleLangs);
     if (!tracks || !tracks.length) {
       throw new Error('Complete demux returned no tracks');
     }
@@ -3615,7 +3814,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
   console.log('[Background] Attempting video-based subtitle extraction (primary method)...');
   sendExtractProgress(tabId, messageId, 5, 'Loading video for subtitle extraction...');
   try {
-    const videoTracks = applyLangHints(await extractSubtitlesViaVideoOffscreen(streamUrl, extractionMode, messageId, tabId));
+    const videoTracks = applyLangHints(await extractSubtitlesViaVideoOffscreen(streamUrl, extractionMode, messageId, tabId, { signal }));
     if (videoTracks && videoTracks.length > 0) {
       console.log(`[Background] Video-based extraction succeeded: ${videoTracks.length} track(s)`);
       sendExtractProgress(tabId, messageId, 100, `Extracted ${videoTracks.length} track(s) via video element`);
@@ -3624,6 +3823,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
     sendExtractProgress(tabId, messageId, 12, 'Video element found no text tracks; switching to FFmpeg fallback...');
     console.log('[Background] Video-based extraction returned no tracks, falling back to FFmpeg method...');
   } catch (videoErr) {
+    if (isAbortError(videoErr)) throw videoErr;
     const reason = videoErr?.message || String(videoErr);
     console.warn('[Background] Video-based extraction failed, falling back to FFmpeg method:', reason);
     sendExtractProgress(tabId, messageId, 12, `Video extraction failed (${reason}); switching to FFmpeg fallback...`);
@@ -3636,9 +3836,10 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
   let sample;
   try {
     sample = isHls
-      ? await fetchHlsSample(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(60, Math.round(p * 0.6)), `Downloading HLS sample from ${hostLabel}...`), {}, baseHeaders)
-      : await fetchByteRangeSample(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(60, p), `Downloading sample from ${hostLabel}...`));
+      ? await fetchHlsSample(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(60, Math.round(p * 0.6)), `Downloading HLS sample from ${hostLabel}...`), {}, baseHeaders, { signal })
+      : await fetchByteRangeSample(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(60, p), `Downloading sample from ${hostLabel}...`), {}, baseHeaders, { signal });
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.error('[Background] Sample fetch failed:', err?.message || err);
     throw new Error(`Failed to fetch media from ${hostLabel}: ${err?.message || err}`);
   }
@@ -3657,7 +3858,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
   sendExtractProgress(tabId, messageId, 70, 'Demuxing subtitle streams...');
   console.log('[Background] Delegating demux to offscreen document...');
   try {
-    let tracks = await demuxSubtitlesOffscreen(buffer, messageId, tabId);
+    let tracks = await demuxSubtitlesOffscreen(buffer, messageId, tabId, { signal });
     tracks = applyLangHints(tracks, sample?.subtitleLangs);
     if (!tracks || !tracks.length) {
       throw new Error('FFmpeg demux returned no tracks');
@@ -3667,12 +3868,13 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
     if (flatCueStarts || nonMonotonicCues) {
       sendDebugLog(tabId, messageId, `Detected ${flatCueStarts ? 'flat' : 'non-monotonic'} cue timestamps after demux; retrying via video element fallback...`, 'warn');
       try {
-        const safeTracks = applyLangHints(await extractSubtitlesViaVideoOffscreen(streamUrl, 'smart', messageId, tabId));
+        const safeTracks = applyLangHints(await extractSubtitlesViaVideoOffscreen(streamUrl, 'smart', messageId, tabId, { signal }));
         if (safeTracks?.length) {
           sendDebugLog(tabId, messageId, 'Video fallback succeeded; returning re-extracted tracks.', 'info');
           return safeTracks;
         }
       } catch (reextractErr) {
+        if (isAbortError(reextractErr)) throw reextractErr;
         sendDebugLog(tabId, messageId, `Video fallback failed (${reextractErr?.message || reextractErr}); keeping demux result.`, 'warn');
       }
     }
@@ -3704,7 +3906,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
       try {
         const tailBytes = Math.max(96 * 1024 * 1024, sampleBytes);
         sendDebugLog(tabId, messageId, `Coverage looks short (last cue ${lastCueSec || 'n/a'}s vs duration ${durationSec || 'n/a'}s); fetching tail slice (~${Math.round(tailBytes / (1024 * 1024))} MB) to merge...`, 'warn');
-        const tail = await fetchTailSample(streamUrl, tailBytes, (p) => sendExtractProgress(tabId, messageId, Math.min(88, 76 + Math.round(p * 0.06)), 'Fetching tail slice to complete subtitles...'), baseHeaders);
+        const tail = await fetchTailSample(streamUrl, tailBytes, (p) => sendExtractProgress(tabId, messageId, Math.min(88, 76 + Math.round(p * 0.06)), 'Fetching tail slice to complete subtitles...'), baseHeaders, { signal });
         const combined = concatBuffers(buffer, tail.buffer);
         let combinedTracks = await demuxSubtitlesOffscreen(combined, messageId, tabId);
         combinedTracks = applyLangHints(combinedTracks, sample?.subtitleLangs || tail?.subtitleLangs);
@@ -3725,6 +3927,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
         }
         sendDebugLog(tabId, messageId, 'Tail slice merge did not improve coverage; keeping original demux.', 'warn');
       } catch (tailMergeErr) {
+        if (isAbortError(tailMergeErr)) throw tailMergeErr;
         console.warn('[Background] Tail merge attempt failed:', tailMergeErr?.message || tailMergeErr);
       }
       return false;
@@ -3746,12 +3949,12 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
         const baseTarget = 900;
         const minDurationSec = Math.min(1800, Math.round(baseTarget * (1 + guardFetches * 0.75)));
         sendDebugLog(tabId, messageId, `Subtitles under 20KB; grabbing ~${Math.round(minDurationSec / 60)}min of HLS for retry (${guardFetches})...`, 'warn');
-        const expanded = await fetchHlsSample(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(90, progressHint + Math.round(p * 0.05)), `Fetching extra HLS video (${guardFetches})...`), { minDurationSec }, baseHeaders);
+        const expanded = await fetchHlsSample(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(90, progressHint + Math.round(p * 0.05)), `Fetching extra HLS video (${guardFetches})...`), { minDurationSec }, baseHeaders, { signal });
         sample = { ...(sample || {}), buffer: expanded.buffer, durationSec: expanded.durationSec || durationSec };
       } else {
         const targetBytes = Math.min(256 * 1024 * 1024, Math.max(MIN_SUB_BYTES * 4, Math.round(sampleBytes * growthFactor)));
         sendDebugLog(tabId, messageId, `Subtitles under 20KB; expanding sample to ~${Math.round(targetBytes / (1024 * 1024))} MB (attempt ${guardFetches})...`, 'warn');
-        const expanded = await fetchByteRangeSample(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(90, progressHint + Math.round(p * 0.05)), `Fetching extra video (${guardFetches})...`), { minBytes: targetBytes });
+        const expanded = await fetchByteRangeSample(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(90, progressHint + Math.round(p * 0.05)), `Fetching extra video (${guardFetches})...`), { minBytes: targetBytes }, baseHeaders, { signal });
         sample = expanded;
         sampleBytes = expanded?.buffer?.byteLength || expanded?.byteLength || sampleBytes;
         totalBytes = expanded?.totalBytes ?? totalBytes;
@@ -3821,12 +4024,14 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
           totalBytes,
           minTrackSize,
           lastCueSec,
-          contentType: sample?.contentType
+          contentType: sample?.contentType,
+          baseHeaders
         });
         if (targeted) {
-          return targeted;
+          return applyLangHints(targeted, sample?.subtitleLangs);
         }
       } catch (mkErr) {
+        if (isAbortError(mkErr)) throw mkErr;
         console.warn('[Background] Targeted MKV strategies failed:', mkErr?.message || mkErr);
       }
     }
@@ -3840,7 +4045,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
       // First try expanding if the initial sample was partial
       if (sample?.partial) {
         try {
-          const expanded = await fetchByteRangeSample(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(85, p), `Downloading larger sample from ${hostLabel}...`));
+          const expanded = await fetchByteRangeSample(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(85, p), `Downloading larger sample from ${hostLabel}...`), {}, baseHeaders, { signal });
           const expandedBytes = expanded?.buffer?.byteLength || 0;
           const expandedMb = Math.round((expandedBytes / (1024 * 1024)) * 10) / 10;
           sendDebugLog(tabId, messageId, `Retrying demux with expanded sample (~${expandedMb} MB)...`, 'info');
@@ -3853,6 +4058,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
           }
           console.warn('[Background] Expanded sample still too small; trying full fetch');
         } catch (expandErr) {
+          if (isAbortError(expandErr)) throw expandErr;
           console.warn('[Background] Expanded sample fetch failed:', expandErr?.message);
         }
       }
@@ -3863,7 +4069,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
         sendDebugLog(tabId, messageId, canFullFetch
           ? 'Fetching full stream for complete subtitles...'
           : 'Total size unknown; fetching full stream up to capped buffer for complete subtitles...', 'warn');
-        const fullRes = await safeFetch(streamUrl);
+        const fullRes = await safeFetch(streamUrl, { ...(baseHeaders ? { headers: baseHeaders } : {}), ...(signal ? { signal } : {}) });
         if (!fullRes.ok) {
           throw new Error(`Full fetch failed (HTTP ${fullRes.status})`);
         }
@@ -3882,6 +4088,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
     }
     return tracks;
   } catch (err) {
+    if (isAbortError(err)) throw err;
     if (sample?.partial) {
       console.warn('[Background] Demux failed on partial sample; retrying with tail slice / larger sample:', err?.message || err);
       sendDebugLog(tabId, messageId, 'Partial sample demux failed. Fetching tail slice to retry...', 'warn');
@@ -3890,12 +4097,13 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
       try {
         // Increased tail limit to ensure better coverage for subtitle extraction
         const tailLimit = Math.max(32 * 1024 * 1024, sampleBytes);
-        tail = await fetchTailSample(streamUrl, tailLimit, (p) => sendExtractProgress(tabId, messageId, Math.min(85, p), `Downloading tail slice from ${hostLabel}...`), baseHeaders);
+        tail = await fetchTailSample(streamUrl, tailLimit, (p) => sendExtractProgress(tabId, messageId, Math.min(85, p), `Downloading tail slice from ${hostLabel}...`), baseHeaders, { signal });
         const tailMb = Math.round(((tail?.buffer?.byteLength || 0) / (1024 * 1024)) * 10) / 10;
         sendDebugLog(tabId, messageId, `Retrying demux with tail slice (~${tailMb} MB)...`, 'info');
         try {
           return await demuxSubtitlesOffscreen(tail.buffer, messageId, tabId);
         } catch (tailOnlyErr) {
+          if (isAbortError(tailOnlyErr)) throw tailOnlyErr;
           attemptErrors.push(tailOnlyErr?.message || String(tailOnlyErr));
           console.warn('[Background] Tail-only demux failed; expanding head sample:', tailOnlyErr?.message || tailOnlyErr);
         }
@@ -3910,19 +4118,21 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
           try {
             return await demuxSubtitlesOffscreen(combined, messageId, tabId);
           } catch (comboErr) {
+            if (isAbortError(comboErr)) throw comboErr;
             attemptErrors.push(comboErr?.message || String(comboErr));
             console.warn('[Background] Head+tail demux failed; fetching larger head sample:', comboErr?.message || comboErr);
           }
         }
 
         sendDebugLog(tabId, messageId, 'Head/tail samples did not demux. Grabbing larger head sample...', 'warn');
-        const expanded = await fetchByteRangeSample(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(92, p), `Downloading larger sample from ${hostLabel}...`));
+        const expanded = await fetchByteRangeSample(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(92, p), `Downloading larger sample from ${hostLabel}...`), {}, baseHeaders, { signal });
         const expandedBytes = expanded?.buffer?.byteLength || 0;
         const expandedMb = Math.round((expandedBytes / (1024 * 1024)) * 10) / 10;
         sendDebugLog(tabId, messageId, `Retrying demux with expanded head sample (~${expandedMb} MB)...`, 'info');
         try {
           return await demuxSubtitlesOffscreen(expanded.buffer, messageId, tabId);
         } catch (expandedErr) {
+          if (isAbortError(expandedErr)) throw expandedErr;
           attemptErrors.push(expandedErr?.message || String(expandedErr));
           const total = expanded?.totalBytes || null;
           // Try expanded head + tail if we have one and haven't combined yet
@@ -3936,6 +4146,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
               sendDebugLog(tabId, messageId, `Retrying demux with expanded head + tail (~${comboMb} MB)...`, 'info');
               return await demuxSubtitlesOffscreen(combo, messageId, tabId);
             } catch (comboExpandedErr) {
+              if (isAbortError(comboExpandedErr)) throw comboExpandedErr;
               attemptErrors.push(comboExpandedErr?.message || String(comboExpandedErr));
               console.warn('[Background] Expanded head + tail demux failed:', comboExpandedErr?.message || comboExpandedErr);
             }
@@ -3944,7 +4155,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
           if (total && total <= 256 * 1024 * 1024) {
             console.warn('[Background] Expanded sample failed; attempting full fetch within 256MB cap');
             sendDebugLog(tabId, messageId, `Expanded sample failed. Fetching full stream (${Math.round(total / (1024 * 1024))} MB) for final attempt...`, 'warn');
-            const fullRes = await safeFetch(streamUrl);
+            const fullRes = await safeFetch(streamUrl, { ...(baseHeaders ? { headers: baseHeaders } : {}), ...(signal ? { signal } : {}) });
             if (!fullRes.ok) {
               throw new Error(`Full fetch failed (HTTP ${fullRes.status})`);
             }
@@ -3955,6 +4166,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
           throw expandedErr;
         }
       } catch (tailErr) {
+        if (isAbortError(tailErr)) throw tailErr;
         attemptErrors.push(tailErr?.message || String(tailErr));
         console.warn('[Background] Tail / expanded demux retry failed:', tailErr?.message || tailErr);
         throw new Error(attemptErrors.join(' | '));
@@ -6256,13 +6468,16 @@ function decodeUtf8Safe(u8) {
 async function fetchRangesInParallel(rangeList, streamUrl, onProgressPerItem, options = {}) {
   const concurrency = Math.max(1, Math.min(options.concurrency || 3, 6));
   const results = new Array(rangeList.length);
+  const signal = options?.signal || null;
+  const baseHeaders = options?.baseHeaders || null;
   let idx = 0;
 
   async function worker() {
     while (idx < rangeList.length) {
+      throwIfAborted(signal, `Range fetch aborted for ${streamUrl}`);
       const current = idx++;
       const r = rangeList[current];
-      results[current] = await fetchRangeSlice(streamUrl, r.start, r.end, (p) => onProgressPerItem?.(current, p));
+      results[current] = await fetchRangeSlice(streamUrl, r.start, r.end, (p) => onProgressPerItem?.(current, p), baseHeaders, { signal });
     }
   }
 
@@ -6533,8 +6748,11 @@ async function tryCueGuidedMkvExtraction(ctx) {
     sampleBytes,
     messageId,
     tabId,
-    hostLabel
+    hostLabel,
+    baseHeaders = null
   } = ctx;
+  const signal = ctx?.signal || getExtractJobSignal(messageId);
+  throwIfAborted(signal, 'Extraction cancelled');
 
   const headerInfo = ctx.headerInfo || parseMkvHeaderInfo(sampleBuffer, { maxScanBytes: Math.min(sampleBytes || 0, 12 * 1024 * 1024) || 12 * 1024 * 1024 });
   const subtitleTracks = headerInfo.tracks.filter(t => t.type === 0x11 || t.type === 17 || t.codecId?.toLowerCase().includes('s_text'));
@@ -6574,10 +6792,11 @@ async function tryCueGuidedMkvExtraction(ctx) {
     const cueWindow = 8 * 1024 * 1024;
     try {
       sendDebugLog(tabId, messageId, 'Fetching Cues via SeekHead...', 'info');
-      const cueBuf = await fetchRangeSlice(streamUrl, cueStart, cueStart + cueWindow - 1, (p) => sendExtractProgress(tabId, messageId, Math.min(87, 70 + p * 0.05), `Fetching Cues from ${hostLabel}...`));
+      const cueBuf = await fetchRangeSlice(streamUrl, cueStart, cueStart + cueWindow - 1, (p) => sendExtractProgress(tabId, messageId, Math.min(87, 70 + p * 0.05), `Fetching Cues from ${hostLabel}...`), baseHeaders, { signal });
       const parsed = parseMkvHeaderInfo(cueBuf.buffer || cueBuf, { maxScanBytes: cueWindow });
       cueList = parsed.cues?.length ? parsed.cues : null;
     } catch (err) {
+      if (isAbortError(err)) throw err;
       console.warn('[Background] Cue fetch via SeekHead failed:', err?.message || err);
     }
   }
@@ -6622,10 +6841,11 @@ async function tryCueGuidedMkvExtraction(ctx) {
       merged,
       streamUrl,
       (idx, p) => sendExtractProgress(tabId, messageId, Math.min(90, 75 + Math.round(p * 0.05)), `Cue window ${idx + 1}/${rangeCount}...`),
-      { concurrency: 3 }
+      { concurrency: 3, signal, baseHeaders }
     );
     fetchedBuffers = results.map(r => r.buffer || r);
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.warn('[Background] Cue-guided range fetch failed:', err?.message || err);
     if (attachmentTracks.length) return attachmentTracks;
     return null;
@@ -6641,6 +6861,7 @@ async function tryCueGuidedMkvExtraction(ctx) {
       return combined;
     }
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.warn('[Background] Cue-guided demux failed:', err?.message || err);
   }
 
@@ -6822,8 +7043,11 @@ async function scanClustersForSubtitles(ctx) {
     tabId,
     hostLabel,
     totalBytes,
-    contentType
+    contentType,
+    baseHeaders = null
   } = ctx;
+  const signal = ctx?.signal || getExtractJobSignal(messageId);
+  throwIfAborted(signal, 'Extraction cancelled');
 
   const looksMkv = isLikelyMkv(streamUrl, contentType, sampleBuffer);
   if (!looksMkv) return null;
@@ -6873,7 +7097,8 @@ async function scanClustersForSubtitles(ctx) {
       const start = Math.max(0, pos);
       const end = start + probeBytes - 1;
       try {
-        const slice = await fetchRangeSlice(streamUrl, start, end, (p) => sendExtractProgress(tabId, messageId, Math.min(86, 70 + p * 0.03), `Scanning clusters ${i + 1}/${stepCount}...`));
+        const slice = await fetchRangeSlice(streamUrl, start, end, (p) => sendExtractProgress(tabId, messageId, Math.min(86, 70 + p * 0.03), `Scanning clusters ${i + 1}/${stepCount}...`), baseHeaders, { signal });
+        throwIfAborted(signal, 'Extraction cancelled');
         const sliceU8 = slice.buffer instanceof Uint8Array ? slice.buffer : new Uint8Array(slice.buffer || slice);
         const hits = findClusters(sliceU8);
         for (const h of hits) {
@@ -6881,6 +7106,7 @@ async function scanClustersForSubtitles(ctx) {
           clusterWindows.push({ start: globalStart, end: globalStart + halfWin * 2 });
         }
       } catch (err) {
+        if (isAbortError(err)) throw err;
         console.warn('[Background] Cluster scan range failed:', err?.message || err);
       }
     }
@@ -6895,12 +7121,13 @@ async function scanClustersForSubtitles(ctx) {
       merged,
       streamUrl,
       (idx, p) => sendExtractProgress(tabId, messageId, Math.min(90, 75 + Math.round(p * 0.05)), `Cluster window ${idx + 1}/${rangeCount}...`),
-      { concurrency: 3 }
+      { concurrency: 3, signal, baseHeaders }
     );
     const stitched = concatBuffersList([sampleBuffer, ...results.map(r => r.buffer || r)]);
     const tracks = await demuxSubtitlesOffscreen(stitched, messageId, tabId);
     if (tracks?.length) return tracks;
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.warn('[Background] Cluster scan demux failed:', err?.message || err);
   }
   return null;
@@ -6914,8 +7141,10 @@ async function streamSubtitlesWithCoverage(ctx) {
     hostLabel,
     durationSec,
     totalBytes,
-    contentType
+    contentType,
+    baseHeaders = null
   } = ctx;
+  const signal = ctx?.signal || getExtractJobSignal(messageId);
 
   const looksMkv = isLikelyMkv(streamUrl, contentType);
   if (!looksMkv) return null;
@@ -6932,8 +7161,9 @@ async function streamSubtitlesWithCoverage(ctx) {
     : null);
 
   while (offset < maxBytes) {
+    throwIfAborted(signal, 'Extraction cancelled');
     const end = Math.min(offset + chunkSize - 1, (totalBytes || offset + chunkSize) - 1);
-    const slice = await fetchRangeSlice(streamUrl, offset, end, (p) => sendExtractProgress(tabId, messageId, Math.min(88, 70 + p * 0.05), `Streaming demux @${Math.round(offset / (1024 * 1024))}MB...`));
+    const slice = await fetchRangeSlice(streamUrl, offset, end, (p) => sendExtractProgress(tabId, messageId, Math.min(88, 70 + p * 0.05), `Streaming demux @${Math.round(offset / (1024 * 1024))}MB...`), baseHeaders, { signal });
     buffers.push(slice.buffer || slice);
     const stitched = concatBuffersList(buffers);
     try {
@@ -6948,6 +7178,7 @@ async function streamSubtitlesWithCoverage(ctx) {
         return tracks;
       }
     } catch (err) {
+      if (isAbortError(err)) throw err;
       console.warn('[Background] Streaming coverage demux failed at chunk:', err?.message || err);
     }
     offset += chunkSize;
@@ -6967,8 +7198,11 @@ async function tryTargetedMkvStrategies(ctx) {
     totalBytes,
     minTrackSize,
     lastCueSec,
-    contentType
+    contentType,
+    baseHeaders = null
   } = ctx;
+  const signal = ctx?.signal || getExtractJobSignal(messageId);
+  ctx.signal = signal;
 
   const looksMkv = isLikelyMkv(streamUrl, contentType, sampleBuffer);
   if (!looksMkv) {
@@ -6988,6 +7222,7 @@ async function tryTargetedMkvStrategies(ctx) {
       return cueRes;
     }
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.warn('[Background] Cue-guided MKV extraction failed:', err?.message || err);
   }
 
@@ -6997,6 +7232,7 @@ async function tryTargetedMkvStrategies(ctx) {
       return clusterRes;
     }
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.warn('[Background] Cluster-scan MKV extraction failed:', err?.message || err);
   }
 
@@ -7006,13 +7242,14 @@ async function tryTargetedMkvStrategies(ctx) {
       return streamRes;
     }
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.warn('[Background] Streaming coverage extraction failed:', err?.message || err);
   }
 
   // Dual head+tail probing: grab a generous tail slice and retry demux on combined buffer
   try {
     sendDebugLog(tabId, messageId, `Dual head+tail probing (~${Math.round(tailLimit / (1024 * 1024))} MB tail)...`, 'warn');
-    const tail = await fetchTailSample(streamUrl, tailLimit, (p) => sendExtractProgress(tabId, messageId, Math.min(88, 70 + p * 0.1), `Downloading tail slice from ${hostLabel}...`), baseHeaders);
+    const tail = await fetchTailSample(streamUrl, tailLimit, (p) => sendExtractProgress(tabId, messageId, Math.min(88, 70 + p * 0.1), `Downloading tail slice from ${hostLabel}...`), baseHeaders, { signal });
     const combined = concatBuffers(sampleBuffer, tail.buffer);
     const combinedTracks = await demuxSubtitlesOffscreen(combined, messageId, tabId);
     const summary = summarizeTracks(combinedTracks);
@@ -7021,6 +7258,7 @@ async function tryTargetedMkvStrategies(ctx) {
     }
     currentBest = summary;
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.warn('[Background] Head+tail probing failed:', err?.message || err);
   }
 
@@ -7031,7 +7269,7 @@ async function tryTargetedMkvStrategies(ctx) {
     const midEnd = Math.min(totalBytes - 1, midStart + windowSize);
     try {
       sendDebugLog(tabId, messageId, 'Fetching mid-file probe for late subtitle clusters...', 'warn');
-      const midSlice = await fetchRangeSlice(streamUrl, midStart, midEnd, (p) => sendExtractProgress(tabId, messageId, Math.min(90, 80 + p * 0.05), `Fetching mid-file probe (${hostLabel})...`));
+      const midSlice = await fetchRangeSlice(streamUrl, midStart, midEnd, (p) => sendExtractProgress(tabId, messageId, Math.min(90, 80 + p * 0.05), `Fetching mid-file probe (${hostLabel})...`), baseHeaders, { signal });
       const stitched = concatBuffers(sampleBuffer, midSlice.buffer);
       const midTracks = await demuxSubtitlesOffscreen(stitched, messageId, tabId);
       const summary = summarizeTracks(midTracks);
@@ -7040,6 +7278,7 @@ async function tryTargetedMkvStrategies(ctx) {
       }
       currentBest = summary;
     } catch (err) {
+      if (isAbortError(err)) throw err;
       console.warn('[Background] Mid-file probe failed:', err?.message || err);
     }
   }
@@ -7047,13 +7286,14 @@ async function tryTargetedMkvStrategies(ctx) {
   //   // As a last light attempt, rerun guard with a higher cap.
   {
     try {
-      const expanded = await fetchByteRangeSample(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(93, 85 + p * 0.05), `Retrying with larger sample (${hostLabel})...`), { minBytes: 192 * 1024 * 1024 });
+      const expanded = await fetchByteRangeSample(streamUrl, (p) => sendExtractProgress(tabId, messageId, Math.min(93, 85 + p * 0.05), `Retrying with larger sample (${hostLabel})...`), { minBytes: 192 * 1024 * 1024 }, baseHeaders, { signal });
       const expandedTracks = await demuxSubtitlesOffscreen(expanded.buffer, messageId, tabId);
       const summary = summarizeTracks(expandedTracks);
       if ((summary.minTrackSize || 0) > (currentBest.minTrackSize || 0) || (summary.lastCueSec || 0) > (currentBest.lastCueSec || 0)) {
         return expandedTracks;
       }
     } catch (err) {
+      if (isAbortError(err)) throw err;
       console.warn('[Background] Expanded sample retry in targeted stage failed:', err?.message || err);
     }
   }
@@ -7061,17 +7301,108 @@ async function tryTargetedMkvStrategies(ctx) {
   return null;
 }
 
-async function fetchFullStreamBuffer(url, onProgress, baseHeaders = null) {
-  const fetchOpts = baseHeaders ? { headers: baseHeaders } : undefined;
+async function tryCompleteModeRangeRecovery(ctx) {
+  const {
+    streamUrl,
+    messageId,
+    tabId,
+    hostLabel,
+    baseHeaders = null,
+    initialSample = null
+  } = ctx;
+  const signal = ctx?.signal || getExtractJobSignal(messageId);
+
+  let sample = initialSample;
+  if (!sample?.buffer?.byteLength) {
+    sendDebugLog(tabId, messageId, 'Range recovery: fetching targeted head sample...', 'warn');
+    sample = await fetchByteRangeSample(
+      streamUrl,
+      (p) => sendExtractProgress(tabId, messageId, Math.min(84, 20 + Math.round(p * 0.45)), `Range recovery: sampling ${hostLabel}...`),
+      { minBytes: 96 * 1024 * 1024, maxBytesCap: 192 * 1024 * 1024 },
+      baseHeaders,
+      { signal }
+    );
+  }
+
+  const buffer = sample?.buffer;
+  if (!buffer?.byteLength) {
+    return null;
+  }
+
+  let headTracks = [];
+  let summary = { minTrackSize: 0, lastCueSec: null };
+  const durationSec = sample?.durationSec || probeContainerDuration(buffer) || null;
+
+  try {
+    headTracks = await demuxSubtitlesOffscreen(buffer, messageId, tabId);
+    summary = summarizeTracks(headTracks);
+    if (headTracks.length) {
+      const timelines = analyzeCueTimelines(headTracks);
+      const qualityOk = isTrackQualityAcceptable(headTracks, summary, timelines, durationSec);
+      const coverageOk = !durationSec || !summary.lastCueSec || summary.lastCueSec >= durationSec * 0.9;
+      if (qualityOk && coverageOk) {
+        sendDebugLog(tabId, messageId, 'Range recovery: head sample already looks complete; using it instead of full download.', 'info');
+        return { tracks: headTracks, mode: 'head-sample' };
+      }
+      sendDebugLog(
+        tabId,
+        messageId,
+        `Range recovery: head sample incomplete (min=${Math.round((summary.minTrackSize || 0) / 1024)}KB, last=${summary.lastCueSec ? Math.round(summary.lastCueSec) + 's' : 'n/a'}); trying targeted MKV recovery...`,
+        'warn'
+      );
+    }
+  } catch (headErr) {
+    if (isAbortError(headErr)) throw headErr;
+    sendDebugLog(tabId, messageId, `Range recovery head demux failed (${headErr?.message || headErr}); trying targeted MKV recovery...`, 'warn');
+  }
+
+  const targeted = await tryTargetedMkvStrategies({
+    streamUrl,
+    sampleBuffer: buffer,
+    sampleBytes: buffer.byteLength,
+    messageId,
+    tabId,
+    hostLabel,
+    durationSec,
+    totalBytes: sample?.totalBytes || null,
+    minTrackSize: summary.minTrackSize || 0,
+    lastCueSec: summary.lastCueSec || null,
+    contentType: sample?.contentType || '',
+    baseHeaders,
+    signal
+  });
+
+  if (targeted?.length) {
+    sendDebugLog(tabId, messageId, 'Range recovery: targeted MKV strategy succeeded.', 'info');
+    return { tracks: targeted, mode: 'targeted-mkv' };
+  }
+
+  return null;
+}
+
+async function fetchFullStreamBuffer(url, onProgress, baseHeaders = null, options = {}) {
+  const signal = options?.signal || null;
+  const fetchOpts = {
+    ...(baseHeaders ? { headers: baseHeaders } : {}),
+    ...(signal ? { signal } : {})
+  };
   const res = await safeFetch(url, fetchOpts);
   if (!res.ok) {
     throw new Error(`Full fetch failed (HTTP ${res.status})`);
   }
   const contentType = res.headers?.get?.('content-type') || '';
   const totalBytes = parseInt(res.headers.get('content-length') || '0', 10) || null;
+  if (totalBytes && totalBytes > MAX_COMPLETE_IN_BROWSER_BYTES) {
+    throw new Error(`Full fetch requires ${formatByteCount(totalBytes)} in RAM, which exceeds the in-browser safe limit. Use Disk mode or range-based recovery.`);
+  }
   const reader = res.body && typeof res.body.getReader === 'function' ? res.body.getReader() : null;
   if (!reader) {
-    const buf = await res.arrayBuffer();
+    let buf;
+    try {
+      buf = await res.arrayBuffer();
+    } catch (err) {
+      throw buildFullFetchPhaseError(url, res, 'arrayBuffer conversion', 0, totalBytes, err);
+    }
     onProgress?.(100);
     return { buffer: buf, totalBytes: totalBytes || (buf?.byteLength || null), contentType };
   }
@@ -7081,17 +7412,33 @@ async function fetchFullStreamBuffer(url, onProgress, baseHeaders = null) {
   let allocated = null;
 
   if (totalBytes && totalBytes > 0) {
-    allocated = new Uint8Array(totalBytes);
+    try {
+      allocated = new Uint8Array(totalBytes);
+    } catch (err) {
+      throw buildFullFetchPhaseError(url, res, 'RAM allocation', 0, totalBytes, err);
+    }
   }
 
   while (true) {
-    const { done, value } = await reader.read();
+    throwIfAborted(signal, `Full fetch aborted for ${url}`);
+    let chunk;
+    try {
+      chunk = await reader.read();
+    } catch (err) {
+      if (isAbortError(err)) throw err;
+      throw buildFullFetchPhaseError(url, res, 'network read', received, totalBytes, err);
+    }
+    const { done, value } = chunk;
     if (done) break;
     if (value && value.length) {
-      if (allocated) {
-        allocated.set(value, received);
-      } else {
-        chunks.push(value);
+      try {
+        if (allocated) {
+          allocated.set(value, received);
+        } else {
+          chunks.push(value);
+        }
+      } catch (err) {
+        throw buildFullFetchPhaseError(url, res, 'buffer write', received, totalBytes, err);
       }
       received += value.length;
       const pct = totalBytes ? Math.round((received / totalBytes) * 95) : Math.min(95, Math.round(received / (1024 * 1024)));
@@ -7131,18 +7478,30 @@ async function getStreamBufferMode() {
  *
  * Returns the same { buffer, totalBytes, contentType } shape as fetchFullStreamBuffer.
  */
-async function fetchFullStreamBufferOPFS(url, onProgress, baseHeaders = null) {
-  const fetchOpts = baseHeaders ? { headers: baseHeaders } : undefined;
+async function fetchFullStreamBufferOPFS(url, onProgress, baseHeaders = null, options = {}) {
+  const signal = options?.signal || null;
+  const fetchOpts = {
+    ...(baseHeaders ? { headers: baseHeaders } : {}),
+    ...(signal ? { signal } : {})
+  };
   const res = await safeFetch(url, fetchOpts);
   if (!res.ok) {
     throw new Error(`Full fetch failed (HTTP ${res.status})`);
   }
   const contentType = res.headers?.get?.('content-type') || '';
   const totalBytes = parseInt(res.headers.get('content-length') || '0', 10) || null;
+  if (totalBytes && totalBytes > MAX_COMPLETE_IN_BROWSER_BYTES) {
+    throw new Error(`Full fetch final memory map requires ${formatByteCount(totalBytes)}, which exceeds the in-browser safe limit. Use range-based recovery instead.`);
+  }
   const reader = res.body && typeof res.body.getReader === 'function' ? res.body.getReader() : null;
   if (!reader) {
     // No streaming body — fall back to simple arrayBuffer (usually small responses)
-    const buf = await res.arrayBuffer();
+    let buf;
+    try {
+      buf = await res.arrayBuffer();
+    } catch (err) {
+      throw buildFullFetchPhaseError(url, res, 'arrayBuffer conversion', 0, totalBytes, err);
+    }
     onProgress?.(100);
     return { buffer: buf, totalBytes: totalBytes || (buf?.byteLength || null), contentType };
   }
@@ -7152,29 +7511,55 @@ async function fetchFullStreamBufferOPFS(url, onProgress, baseHeaders = null) {
   let root, fileHandle, writable;
 
   try {
-    root = await navigator.storage.getDirectory();
-    fileHandle = await root.getFileHandle(tempName, { create: true });
-    writable = await fileHandle.createWritable();
+    try {
+      root = await navigator.storage.getDirectory();
+      fileHandle = await root.getFileHandle(tempName, { create: true });
+      writable = await fileHandle.createWritable();
+    } catch (err) {
+      throw buildFullFetchPhaseError(url, res, 'disk buffer setup', 0, totalBytes, err);
+    }
 
     let received = 0;
 
     while (true) {
-      const { done, value } = await reader.read();
+      throwIfAborted(signal, `Full fetch aborted for ${url}`);
+      let chunk;
+      try {
+        chunk = await reader.read();
+      } catch (err) {
+        if (isAbortError(err)) throw err;
+        throw buildFullFetchPhaseError(url, res, 'network read', received, totalBytes, err);
+      }
+      const { done, value } = chunk;
       if (done) break;
       if (value && value.length) {
-        await writable.write(value);
+        try {
+          await writable.write(value);
+        } catch (err) {
+          throw buildFullFetchPhaseError(url, res, 'disk write', received, totalBytes, err);
+        }
         received += value.length;
         const pct = totalBytes ? Math.round((received / totalBytes) * 95) : Math.min(95, Math.round(received / (1024 * 1024)));
         onProgress?.(Math.min(95, pct));
       }
     }
 
-    await writable.close();
+    try {
+      await writable.close();
+    } catch (err) {
+      throw buildFullFetchPhaseError(url, res, 'disk finalization', received, totalBytes, err);
+    }
     writable = null; // Mark as closed so finally doesn't double-close
 
     // Read the completed file back as an ArrayBuffer
-    const file = await fileHandle.getFile();
-    const buffer = await file.arrayBuffer();
+    let file;
+    let buffer;
+    try {
+      file = await fileHandle.getFile();
+      buffer = await file.arrayBuffer();
+    } catch (err) {
+      throw buildFullFetchPhaseError(url, res, 'final memory map', received, totalBytes, err);
+    }
 
     onProgress?.(100);
     return { buffer, totalBytes: totalBytes || received, contentType };
@@ -7193,27 +7578,28 @@ async function fetchFullStreamBufferOPFS(url, onProgress, baseHeaders = null) {
  * Dispatcher: fetch full stream buffer using the user's preferred mode (disk/ram).
  * All callers should use this instead of fetchFullStreamBuffer directly.
  */
-async function fetchFullStream(url, onProgress, baseHeaders = null) {
+async function fetchFullStream(url, onProgress, baseHeaders = null, options = {}) {
   const mode = await getStreamBufferMode();
   if (mode === 'ram') {
-    return fetchFullStreamBuffer(url, onProgress, baseHeaders);
+    return fetchFullStreamBuffer(url, onProgress, baseHeaders, options);
   }
   // Default to OPFS (disk) mode — safer for large files
   try {
-    return await fetchFullStreamBufferOPFS(url, onProgress, baseHeaders);
+    return await fetchFullStreamBufferOPFS(url, onProgress, baseHeaders, options);
   } catch (opfsErr) {
     // If OPFS is unavailable (e.g. older browser, permissions), fall back to RAM silently
     const isOPFSUnavailable = /getDirectory|storage|OPFS|SecurityError|NotAllowedError/i.test(opfsErr?.message || opfsErr?.name || '');
     if (isOPFSUnavailable) {
       console.warn('[Background] OPFS unavailable, falling back to RAM mode:', opfsErr?.message || opfsErr);
-      return fetchFullStreamBuffer(url, onProgress, baseHeaders);
+      return fetchFullStreamBuffer(url, onProgress, baseHeaders, options);
     }
     throw opfsErr;
   }
 }
 
-async function fetchFullHlsStream(m3u8Url, onProgress, baseHeaders = null) {
-  const { segments, totalDurationSec, map } = await resolveHlsPlaylist(m3u8Url, baseHeaders);
+async function fetchFullHlsStream(m3u8Url, onProgress, baseHeaders = null, options = {}) {
+  const signal = options?.signal || null;
+  const { segments, totalDurationSec, map } = await resolveHlsPlaylist(m3u8Url, baseHeaders, 0, { signal });
   const buffers = [];
   let totalBytes = 0;
   const totalSegments = segments.length || 1;
@@ -7222,7 +7608,7 @@ async function fetchFullHlsStream(m3u8Url, onProgress, baseHeaders = null) {
       const headers = map.byterange
         ? mergeHeaders(baseHeaders, { Range: `bytes=${map.byterange.offset || 0}-${(map.byterange.offset || 0) + map.byterange.length - 1}` })
         : baseHeaders;
-      const res = await safeFetch(map.uri, headers ? { headers } : undefined);
+      const res = await safeFetch(map.uri, { ...(headers ? { headers } : {}), ...(signal ? { signal } : {}) });
       if (!res.ok) throw new Error(`Init segment fetch failed (${res.status})`);
       const initBuf = new Uint8Array(await res.arrayBuffer());
       buffers.push(initBuf);
@@ -7233,8 +7619,9 @@ async function fetchFullHlsStream(m3u8Url, onProgress, baseHeaders = null) {
   }
 
   for (let i = 0; i < segments.length; i++) {
+    throwIfAborted(signal, `HLS fetch aborted for ${m3u8Url}`);
     const seg = segments[i];
-    const res = await safeFetch(seg.uri, baseHeaders ? { headers: baseHeaders } : undefined);
+    const res = await safeFetch(seg.uri, { ...(baseHeaders ? { headers: baseHeaders } : {}), ...(signal ? { signal } : {}) });
     if (!res.ok) throw new Error(`Segment fetch failed (HTTP ${res.status})`);
     const buf = new Uint8Array(await res.arrayBuffer());
     buffers.push(buf);
@@ -7248,11 +7635,12 @@ async function fetchFullHlsStream(m3u8Url, onProgress, baseHeaders = null) {
   return { buffer: stitched, durationSec: totalDurationSec, totalBytes, contentType: 'application/vnd.apple.mpegurl' };
 }
 
-async function fetchByteRangeSample(url, onProgress, options = {}, baseHeaders = null) {
+async function fetchByteRangeSample(url, onProgress, options = {}, baseHeaders = null, fetchOptions = {}) {
   // Single mode: start at 64MB, allow growth via options up to 768MB
   const baseLimit = Math.max(64 * 1024 * 1024, Math.max(0, options?.minBytes || 0));
   const cap = Math.min(options?.maxBytesCap || 512 * 1024 * 1024, 768 * 1024 * 1024);
   const limit = Math.min(cap, baseLimit);
+  const signal = fetchOptions?.signal || null;
 
   const headers = limit > 0 ? { Range: `bytes=0-${limit - 1}` } : undefined;
 
@@ -7261,13 +7649,13 @@ async function fetchByteRangeSample(url, onProgress, options = {}, baseHeaders =
   let isPartial = false;
   try {
     const mergedHeaders = headers ? mergeHeaders(baseHeaders, headers) : baseHeaders;
-    res = await fetchWithBackoff(url, mergedHeaders ? { headers: mergedHeaders } : undefined, 2, 1200);
+    res = await fetchWithBackoff(url, { ...(mergedHeaders ? { headers: mergedHeaders } : {}), ...(signal ? { signal } : {}) }, 2, 1200);
   } catch (err) {
     // Some hosts (e.g. without CORS preflight for Range) reject the ranged request entirely.
     if (headers) {
       console.warn('[Background] Range fetch failed, retrying full fetch without Range header:', err?.message || err);
       usedRange = false;
-      res = await fetchWithBackoff(url, baseHeaders ? { headers: baseHeaders } : undefined, 2, 1200);
+      res = await fetchWithBackoff(url, { ...(baseHeaders ? { headers: baseHeaders } : {}), ...(signal ? { signal } : {}) }, 2, 1200);
     } else {
       throw new Error(`Stream fetch failed: ${err?.message || err}`);
     }
@@ -7275,7 +7663,7 @@ async function fetchByteRangeSample(url, onProgress, options = {}, baseHeaders =
   if (!(res.ok || res.status === 206)) {
     console.warn('[Background] Range request failed, retrying full fetch:', res.status);
     usedRange = false;
-    res = await fetchWithBackoff(url, baseHeaders ? { headers: baseHeaders } : undefined, 2, 1200);
+    res = await fetchWithBackoff(url, { ...(baseHeaders ? { headers: baseHeaders } : {}), ...(signal ? { signal } : {}) }, 2, 1200);
   }
   if (!res.ok && res.status !== 206) {
     throw new Error(`Failed to fetch stream (HTTP ${res.status})`);
@@ -7292,7 +7680,7 @@ async function fetchByteRangeSample(url, onProgress, options = {}, baseHeaders =
       console.warn('[Background] Reading ranged response failed, retrying full fetch without Range:', err?.message || err);
       usedRange = false;
       isPartial = false;
-      res = await safeFetch(url);
+      res = await safeFetch(url, { ...(baseHeaders ? { headers: baseHeaders } : {}), ...(signal ? { signal } : {}) });
       if (!res.ok) throw new Error(`Failed to fetch stream (HTTP ${res.status})`);
       buf = await res.arrayBuffer();
     } else {
@@ -7304,7 +7692,7 @@ async function fetchByteRangeSample(url, onProgress, options = {}, baseHeaders =
       console.warn('[Background] Ranged sample returned 0 bytes, retrying full fetch...');
       usedRange = false;
       isPartial = false;
-      res = await safeFetch(url);
+      res = await safeFetch(url, { ...(baseHeaders ? { headers: baseHeaders } : {}), ...(signal ? { signal } : {}) });
       if (!res.ok) throw new Error(`Failed to fetch stream (HTTP ${res.status})`);
       buf = await res.arrayBuffer();
     }
@@ -7342,10 +7730,11 @@ async function fetchByteRangeSample(url, onProgress, options = {}, baseHeaders =
   };
 }
 
-async function fetchTailSample(url, maxBytes, onProgress, baseHeaders = null) {
+async function fetchTailSample(url, maxBytes, onProgress, baseHeaders = null, options = {}) {
+  const signal = options?.signal || null;
   const suffix = Math.max(1024 * 1024, maxBytes || 8 * 1024 * 1024); // at least 1 MB
   const headers = mergeHeaders(baseHeaders, { Range: `bytes=-${suffix}` });
-  const res = await fetchWithBackoff(url, { headers }, 2, 1200);
+  const res = await fetchWithBackoff(url, { headers, ...(signal ? { signal } : {}) }, 2, 1200);
   if (!res.ok && res.status !== 206) {
     throw new Error(`Tail fetch failed (HTTP ${res.status})`);
   }
@@ -7358,11 +7747,12 @@ async function fetchTailSample(url, maxBytes, onProgress, baseHeaders = null) {
   return { buffer: buf, partial: true, totalBytes: total };
 }
 
-async function fetchRangeSlice(url, start, end, onProgress, baseHeaders = null) {
+async function fetchRangeSlice(url, start, end, onProgress, baseHeaders = null, options = {}) {
+  const signal = options?.signal || null;
   const safeStart = Math.max(0, start || 0);
   const safeEnd = Math.max(safeStart, end || safeStart);
   const headers = mergeHeaders(baseHeaders, { Range: `bytes=${safeStart}-${safeEnd}` });
-  const res = await fetchWithBackoff(url, { headers }, 2, 1200);
+  const res = await fetchWithBackoff(url, { headers, ...(signal ? { signal } : {}) }, 2, 1200);
   if (!res.ok && res.status !== 206) {
     throw new Error(`Range slice fetch failed (HTTP ${res.status})`);
   }
@@ -7417,12 +7807,13 @@ function hydrateOffscreenResult(msg) {
   return clone;
 }
 
-function waitForOffscreenResult(messageId, timeoutMs = 200000) {
+function waitForOffscreenResult(messageId, timeoutMs = 200000, signal = null) {
   const startedAt = Date.now();
   logOffscreenLifecycle('wait-for-result:start', { messageId, timeoutMs });
   let settled = false;
   let timer = null;
   let listener = null;
+  let abortListener = null;
 
   const cancel = () => {
     if (settled) return;
@@ -7430,6 +7821,7 @@ function waitForOffscreenResult(messageId, timeoutMs = 200000) {
     logOffscreenLifecycle('wait-for-result:cancel', { messageId });
     if (timer) clearTimeout(timer);
     if (listener) chrome.runtime.onMessage.removeListener(listener);
+    if (signal && abortListener) signal.removeEventListener('abort', abortListener);
   };
 
   const promise = new Promise((resolve, reject) => {
@@ -7457,6 +7849,17 @@ function waitForOffscreenResult(messageId, timeoutMs = 200000) {
       }
     };
     chrome.runtime.onMessage.addListener(listener);
+    if (signal) {
+      abortListener = () => {
+        cancel();
+        reject(createAbortError(signal.reason || 'Offscreen wait aborted'));
+      };
+      if (signal.aborted) {
+        abortListener();
+        return;
+      }
+      signal.addEventListener('abort', abortListener, { once: true });
+    }
     timer = setTimeout(() => {
       console.warn('[Background][Offscreen] Result wait timed out', { messageId, timeoutMs });
       cancel();
@@ -7712,12 +8115,14 @@ async function sendBufferToOffscreenInChunks(uintPayload, messageId, tabId) {
  * Extract embedded subtitles via video element in offscreen document
  * This is the preferred method as it gets complete tracks without downloading the full video
  */
-async function extractSubtitlesViaVideoOffscreen(streamUrl, mode, messageId, tabId) {
+async function extractSubtitlesViaVideoOffscreen(streamUrl, mode, messageId, tabId, options = {}) {
   const normalizedMode = 'single';
   const endOffscreen = startOffscreenSession();
   let cancel = null;
   const startedAt = Date.now();
+  const signal = options?.signal || getExtractJobSignal(messageId);
   try {
+    throwIfAborted(signal, 'Extraction cancelled');
     await ensureOffscreenDocument();
     sendDebugLog(tabId, messageId, `Video-based extraction: starting (${normalizedMode} mode)`, 'info');
 
@@ -7728,7 +8133,7 @@ async function extractSubtitlesViaVideoOffscreen(streamUrl, mode, messageId, tab
       mode: normalizedMode
     });
 
-    const waitRes = waitForOffscreenResult(requestId, 180000);
+    const waitRes = waitForOffscreenResult(requestId, 180000, signal);
     cancel = waitRes.cancel;
 
     await chrome.runtime.sendMessage({
@@ -7738,6 +8143,7 @@ async function extractSubtitlesViaVideoOffscreen(streamUrl, mode, messageId, tab
       mode: normalizedMode
     });
 
+    throwIfAborted(signal, 'Extraction cancelled');
     const result = await waitRes.promise;
 
     if (!result.success) {
@@ -7758,6 +8164,9 @@ async function extractSubtitlesViaVideoOffscreen(streamUrl, mode, messageId, tab
       message: err?.message || err,
       durationMs: Date.now() - startedAt
     });
+    if (signal?.aborted) {
+      requestOffscreenCancel(messageId, signal.reason || 'Extraction cancelled');
+    }
     if (typeof cancel === 'function') cancel();
     throw err;
   } finally {
@@ -8242,10 +8651,13 @@ function filterTextTracksOnly(tracks) {
   return tracks.filter((t) => t && !(t.binary || t.codec === 'copy' || (typeof t.mime === 'string' && t.mime.toLowerCase().includes('matroska')) || t.source === 'copy'));
 }
 
-async function demuxSubtitlesOffscreen(buffer, messageId, tabId) {
+async function demuxSubtitlesOffscreen(buffer, messageId, tabId, options = {}) {
   const endOffscreen = startOffscreenSession();
   const startedAt = Date.now();
+  const signal = options?.signal || getExtractJobSignal(messageId);
+  const abortReason = options?.abortReason || 'Extraction cancelled';
   try {
+    throwIfAborted(signal, abortReason);
     await ensureOffscreenDocument();
     sendDebugLog(tabId, messageId, 'Offscreen FFmpeg demux: starting', 'info');
     let payload = normalizeBufferForTransfer(buffer);
@@ -8270,22 +8682,32 @@ async function demuxSubtitlesOffscreen(buffer, messageId, tabId) {
     });
     logOffscreenLifecycle('demux:start', { messageId, bytes: sendBytes });
     const timeoutMs = 180000; // allow time for first-time core download
-    const { promise: pushedResponse, cancel: cancelPushWait } = waitForOffscreenResult(messageId, timeoutMs + 20000);
+    const { promise: pushedResponse, cancel: cancelPushWait } = waitForOffscreenResult(messageId, timeoutMs + 20000, signal);
     let cancelDirect = null;
     const sendDemuxRequest = (payload) => new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        return reject(createAbortError(signal.reason || abortReason));
+      }
       let settled = false;
       const finish = (fn, val) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener?.('abort', onAbort);
         fn(val);
       };
       const timer = setTimeout(() => finish(reject, new Error('Offscreen demux timed out')), timeoutMs);
+      const onAbort = () => {
+        requestOffscreenCancel(messageId, signal.reason || abortReason);
+        finish(reject, createAbortError(signal.reason || abortReason));
+      };
       cancelDirect = () => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener?.('abort', onAbort);
       };
+      signal?.addEventListener?.('abort', onAbort, { once: true });
       try {
         console.log('[Background][Offscreen] Sending demux request payload', {
           messageId: payload?.messageId,
@@ -8320,6 +8742,7 @@ async function demuxSubtitlesOffscreen(buffer, messageId, tabId) {
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
+          throwIfAborted(signal, abortReason);
           if (mustChunk) {
             const Transfer = await ensureTransferHelper();
             console.log('[Background] Buffer exceeds direct offscreen limit; using IDB transfer', { bytes: sendBytes });
@@ -8387,6 +8810,7 @@ async function demuxSubtitlesOffscreen(buffer, messageId, tabId) {
       const needsPushResult = response?.success && (!response.tracks || !response.tracks.length || response.chunked);
       if (needsPushResult) {
         try {
+          throwIfAborted(signal, abortReason);
           console.log('[Background][Offscreen] Waiting for pushed demux result (tracks missing from direct response)...', { messageId });
           const pushed = await pushedResponse;
           if (pushed) {
@@ -8441,9 +8865,10 @@ async function demuxSubtitlesOffscreen(buffer, messageId, tabId) {
   }
 }
 
-async function resolveHlsPlaylist(m3u8Url, baseHeaders = null, depth = 0) {
+async function resolveHlsPlaylist(m3u8Url, baseHeaders = null, depth = 0, options = {}) {
   if (depth > 3) throw new Error('HLS playlist recursion exceeded');
-  const text = await (await safeFetch(m3u8Url, baseHeaders ? { headers: baseHeaders } : undefined)).text();
+  const signal = options?.signal || null;
+  const text = await (await safeFetch(m3u8Url, { ...(baseHeaders ? { headers: baseHeaders } : {}), ...(signal ? { signal } : {}) })).text();
   const parseAttrs = (line) => {
     const attrs = {};
     line.replace(/([A-Z0-9-]+)=("[^"]*"|[^,]*)/gi, (_, k, v) => {
@@ -8542,12 +8967,12 @@ async function resolveHlsPlaylist(m3u8Url, baseHeaders = null, depth = 0) {
 
     if (audioChoice?.uri) {
       const audioUrl = new URL(audioChoice.uri, m3u8Url).toString();
-      return { ...(await resolveHlsPlaylist(audioUrl, baseHeaders, depth + 1)), subtitleLangs: subtitleTracks };
+      return { ...(await resolveHlsPlaylist(audioUrl, baseHeaders, depth + 1, options)), subtitleLangs: subtitleTracks };
     }
 
     if (!preferredVariant?.uri) throw new Error('No variant stream found');
     const variantUrl = new URL(preferredVariant.uri, m3u8Url).toString();
-    return { ...(await resolveHlsPlaylist(variantUrl, baseHeaders, depth + 1)), subtitleLangs: subtitleTracks };
+    return { ...(await resolveHlsPlaylist(variantUrl, baseHeaders, depth + 1, options)), subtitleLangs: subtitleTracks };
   }
 
   // Media playlist
@@ -8588,8 +9013,9 @@ function sliceSegmentsForWindow(segments, startSec, durSec) {
   return chosen;
 }
 
-async function fetchHlsWindows(m3u8Url, onProgress, planInput = null, baseHeaders = null) {
-  const { segments, totalDurationSec, map, subtitleLangs = [] } = await resolveHlsPlaylist(m3u8Url, baseHeaders);
+async function fetchHlsWindows(m3u8Url, onProgress, planInput = null, baseHeaders = null, options = {}) {
+  const signal = options?.signal || null;
+  const { segments, totalDurationSec, map, subtitleLangs = [] } = await resolveHlsPlaylist(m3u8Url, baseHeaders, 0, { signal });
   const { windows } = planWindows(totalDurationSec, normalizeSyncPlan(planInput));
   const totalSegmentsToFetch = windows
     .map(w => sliceSegmentsForWindow(segments, w.startSec, w.durSec).length)
@@ -8604,7 +9030,7 @@ async function fetchHlsWindows(m3u8Url, onProgress, planInput = null, baseHeader
       const headers = map.byterange
         ? mergeHeaders(baseHeaders, { Range: `bytes=${map.byterange.offset || 0}-${(map.byterange.offset || 0) + map.byterange.length - 1}` })
         : baseHeaders;
-      const res = await safeFetch(map.uri, headers ? { headers } : undefined);
+      const res = await safeFetch(map.uri, { ...(headers ? { headers } : {}), ...(signal ? { signal } : {}) });
       if (!res.ok) throw new Error(`Init segment fetch failed (${res.status})`);
       mapBytes = new Uint8Array(await res.arrayBuffer());
       const expected = map.byterange?.length;
@@ -8624,7 +9050,8 @@ async function fetchHlsWindows(m3u8Url, onProgress, planInput = null, baseHeader
     }
     const buffers = [];
     for (const seg of segs) {
-      const res = await safeFetch(seg.uri, baseHeaders ? { headers: baseHeaders } : undefined);
+      throwIfAborted(signal, `HLS window fetch aborted for ${m3u8Url}`);
+      const res = await safeFetch(seg.uri, { ...(baseHeaders ? { headers: baseHeaders } : {}), ...(signal ? { signal } : {}) });
       if (!res.ok) throw new Error(`Segment fetch failed: ${res.status}`);
       buffers.push(new Uint8Array(await res.arrayBuffer()));
       fetchedCount += 1;
@@ -8649,8 +9076,9 @@ async function fetchHlsWindows(m3u8Url, onProgress, planInput = null, baseHeader
   return { windows: result, totalDurationSec, subtitleLangs };
 }
 
-async function fetchHlsSample(m3u8Url, onProgress, options = {}, baseHeaders = null) {
-  const { segments, totalDurationSec, map, subtitleLangs = [] } = await resolveHlsPlaylist(m3u8Url, baseHeaders);
+async function fetchHlsSample(m3u8Url, onProgress, options = {}, baseHeaders = null, fetchOptions = {}) {
+  const signal = fetchOptions?.signal || null;
+  const { segments, totalDurationSec, map, subtitleLangs = [] } = await resolveHlsPlaylist(m3u8Url, baseHeaders, 0, { signal });
   const baseTarget = 900; // seconds to grab in single mode
   const targetDuration = Math.max(baseTarget, Math.round(options?.minDurationSec || 0));
   const buffers = [];
@@ -8663,7 +9091,7 @@ async function fetchHlsSample(m3u8Url, onProgress, options = {}, baseHeaders = n
       const headers = map.byterange
         ? mergeHeaders(baseHeaders, { Range: `bytes=${map.byterange.offset || 0}-${(map.byterange.offset || 0) + map.byterange.length - 1}` })
         : baseHeaders;
-      const res = await safeFetch(map.uri, headers ? { headers } : undefined);
+      const res = await safeFetch(map.uri, { ...(headers ? { headers } : {}), ...(signal ? { signal } : {}) });
       if (!res.ok) throw new Error(`Init segment fetch failed (${res.status})`);
       mapBytes = new Uint8Array(await res.arrayBuffer());
     } catch (err) {
@@ -8672,7 +9100,8 @@ async function fetchHlsSample(m3u8Url, onProgress, options = {}, baseHeaders = n
   }
 
   for (const seg of segments) {
-    const res = await safeFetch(seg.uri, baseHeaders ? { headers: baseHeaders } : undefined);
+    throwIfAborted(signal, `HLS sample fetch aborted for ${m3u8Url}`);
+    const res = await safeFetch(seg.uri, { ...(baseHeaders ? { headers: baseHeaders } : {}), ...(signal ? { signal } : {}) });
     if (!res.ok) throw new Error(`Segment fetch failed: ${res.status}`);
     buffers.push(new Uint8Array(await res.arrayBuffer()));
     accumulated += seg.dur;

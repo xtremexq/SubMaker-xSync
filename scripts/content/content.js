@@ -613,7 +613,7 @@ async function handleExtractRequest(message) {
 
   try {
     console.log('[SubMaker xSync] Sending EXTRACT_SUBS_REQUEST to background...');
-    const response = await sendRuntimeMessage({
+    await sendRuntimeMessage({
       type: 'EXTRACT_SUBS_REQUEST',
       messageId: message.messageId,
       streamUrl,
@@ -622,22 +622,7 @@ async function handleExtractRequest(message) {
       mode: normalizedMode,
       pageHeaders
     });
-
-    console.log('[SubMaker xSync] Received response from background:', {
-      success: response.success,
-      trackCount: response.tracks?.length,
-      error: response.error
-    });
-
-    clearPendingExtract(message.messageId);
-    sendToPage({
-      type: 'SUBMAKER_EXTRACT_RESPONSE',
-      messageId: message.messageId,
-      source: 'extension',
-      success: response.success,
-      tracks: response.tracks || [],
-      error: response.error || null
-    });
+    console.log('[SubMaker xSync] Background acknowledged extract request; waiting for tab result relay...');
   } catch (error) {
     console.error('[SubMaker xSync] Extract request failed:', error);
     console.error('[SubMaker xSync] Error details:', {
