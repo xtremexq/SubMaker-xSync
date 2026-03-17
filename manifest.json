@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "__MSG_extName__",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "__MSG_extDescription__",
   "default_locale": "en",
   "cross_origin_opener_policy": {
@@ -24,7 +24,7 @@
     "service_worker": "background.bootstrap.js"
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'"
   },
   "content_scripts": [
     {
@@ -57,6 +57,7 @@
     {
       "resources": [
         "background.full.js",
+        "pages/offscreen/ffmpeg-demux-worker.js",
         "assets/lib/ffmpeg.js",
         "assets/lib/ffmpeg.min.js",
         "assets/lib/ffmpeg-core.js",

@@ -158,7 +158,7 @@ function applyTranslations() {
   const streamBufferModeLabel = document.getElementById('streamBufferModeLabel');
   if (streamBufferModeLabel) streamBufferModeLabel.textContent = tOpt('streamBufferMode', 'Stream Buffer Mode');
   const streamBufferModeHint = document.getElementById('streamBufferModeHint');
-  if (streamBufferModeHint) streamBufferModeHint.textContent = tOpt('streamBufferModeHint', 'How large downloads are buffered. Disk is safer for big files; RAM is faster but may crash on files >2 GB.');
+  if (streamBufferModeHint) streamBufferModeHint.textContent = tOpt('streamBufferModeHint', 'How complete-mode downloads are buffered. Disk keeps a local copy and reuses local slices for large-file recovery; RAM keeps the whole stream in memory and is more likely to fail on very large files.');
   const streamBufferDisk = document.getElementById('streamBufferDisk');
   if (streamBufferDisk) streamBufferDisk.textContent = tOpt('streamBufferDisk', 'Disk (default)');
   const streamBufferRam = document.getElementById('streamBufferRam');

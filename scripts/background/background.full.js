@@ -4173,7 +4173,24 @@ async function readResponseCapped(response, maxBytes) {
   return combined.buffer;
 }
 
-async function fetchFullStreamBuffer(url, onProgress, baseHeaders = null) {
+function buildRangeUnsupportedFullFetchError(message) {
+  const err = new Error(message);
+  err.code = 'FULL_FETCH_RANGE_UNSUPPORTED';
+  return err;
+}
+
+function parseContentRangeInfo(headerValue) {
+  const raw = String(headerValue || '').trim();
+  const match = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(raw);
+  if (!match) return null;
+  const start = parseInt(match[1], 10);
+  const end = parseInt(match[2], 10);
+  const total = match[3] === '*' ? null : parseInt(match[3], 10);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  return { start, end, total: Number.isFinite(total) ? total : null };
+}
+
+async function fetchFullStreamBufferLinear(url, onProgress, baseHeaders = null) {
   const MAX_SAFE_BYTES = 1.8 * 1024 * 1024 * 1024;
   const fetchOpts = baseHeaders ? { headers: baseHeaders } : undefined;
   const res = await safeFetch(url, fetchOpts);
@@ -4222,6 +4239,125 @@ async function fetchFullStreamBuffer(url, onProgress, baseHeaders = null) {
   const buffer = concatBuffersList(chunks);
   onProgress?.(100);
   return { buffer, totalBytes: totalBytes || received, contentType, partial: truncated };
+}
+
+async function fetchFullStreamBuffer(url, onProgress, baseHeaders = null) {
+  const MAX_SAFE_BYTES = 1.8 * 1024 * 1024 * 1024;
+  const chunkBytes = 32 * 1024 * 1024;
+  const maxChunkRetries = 3;
+  let received = 0;
+  let totalBytes = null;
+  let contentType = '';
+  let truncated = false;
+  const chunks = [];
+
+  try {
+    while (totalBytes == null || received < totalBytes) {
+      const remainingToCap = MAX_SAFE_BYTES - received;
+      if (remainingToCap <= 0) {
+        truncated = true;
+        console.warn(`[Background] Stream capped at ${Math.round(received / (1024 * 1024))} MB`);
+        break;
+      }
+
+      const rangeStart = received;
+      const plannedSize = totalBytes != null
+        ? Math.max(1, Math.min(chunkBytes, totalBytes - rangeStart, remainingToCap))
+        : Math.max(1, Math.min(chunkBytes, remainingToCap));
+      const rangeEnd = rangeStart + plannedSize - 1;
+      let chunkBuf = null;
+
+      for (let attempt = 0; attempt <= maxChunkRetries; attempt++) {
+        try {
+          const headers = mergeHeaders(baseHeaders, { Range: `bytes=${rangeStart}-${rangeEnd}` });
+          const res = await fetchWithBackoff(url, { headers }, 1, 1000);
+          if (!(res.ok || res.status === 206)) {
+            throw new Error(`Range fetch failed (HTTP ${res.status})`);
+          }
+
+          const nextContentType = res.headers?.get?.('content-type') || '';
+          if (!contentType && nextContentType) {
+            contentType = nextContentType;
+          }
+
+          const contentRange = res.headers.get('content-range');
+          const rangeInfo = parseContentRangeInfo(contentRange);
+          const contentLength = parseInt(res.headers.get('content-length') || '0', 10) || null;
+
+          if (res.status === 206) {
+            if (!rangeInfo) {
+              throw new Error('Range response missing Content-Range');
+            }
+            if (rangeInfo.start !== rangeStart) {
+              throw new Error(`Range response started at ${rangeInfo.start} instead of ${rangeStart}`);
+            }
+            if (rangeInfo.total != null) {
+              if (totalBytes != null && rangeInfo.total !== totalBytes) {
+                throw new Error(`Range response total changed from ${totalBytes} to ${rangeInfo.total}`);
+              }
+              totalBytes = rangeInfo.total;
+            }
+          } else {
+            const rangeIgnored = rangeStart > 0 || !contentLength || contentLength > plannedSize * 1.05;
+            if (rangeIgnored) {
+              try { await res.body?.cancel?.(); } catch (_) { /* best-effort */ }
+              throw buildRangeUnsupportedFullFetchError(`Host ignored byte-range request for ${Math.round(plannedSize / (1024 * 1024))} MB full-download chunk`);
+            }
+            totalBytes = contentLength || totalBytes;
+          }
+
+          const buf = new Uint8Array(await res.arrayBuffer());
+          if (!buf.byteLength) {
+            throw new Error('Range chunk returned 0 bytes');
+          }
+          if (res.status === 206 && buf.byteLength > plannedSize) {
+            throw new Error(`Range chunk exceeded requested size (${buf.byteLength} > ${plannedSize})`);
+          }
+          chunkBuf = buf;
+          break;
+        } catch (err) {
+          if (err?.code === 'FULL_FETCH_RANGE_UNSUPPORTED' && received === 0) {
+            throw err;
+          }
+          if (attempt >= maxChunkRetries) {
+            throw err;
+          }
+          await new Promise(resolve => setTimeout(resolve, 900 * (attempt + 1) + Math.floor(Math.random() * 300)));
+        }
+      }
+
+      chunks.push(chunkBuf);
+      received += chunkBuf.byteLength;
+      const reportTotal = totalBytes ? Math.min(totalBytes, MAX_SAFE_BYTES) : 0;
+      const pct = reportTotal > 0
+        ? Math.round((received / reportTotal) * 95)
+        : Math.min(95, Math.round(received / (1024 * 1024)));
+      onProgress?.(Math.min(95, pct));
+
+      if (totalBytes == null && chunkBuf.byteLength < plannedSize) {
+        totalBytes = received;
+        break;
+      }
+      if (chunkBuf.byteLength < plannedSize && totalBytes != null && received < totalBytes) {
+        throw new Error(`Range chunk ended early at ${received} of ${totalBytes}`);
+      }
+      if (totalBytes != null && totalBytes > MAX_SAFE_BYTES && received >= MAX_SAFE_BYTES) {
+        truncated = true;
+        console.warn(`[Background] Stream capped at ${Math.round(received / (1024 * 1024))} MB`);
+        break;
+      }
+    }
+
+    const buffer = concatBuffersList(chunks);
+    onProgress?.(100);
+    return { buffer, totalBytes: totalBytes || received, contentType, partial: truncated };
+  } catch (err) {
+    if (err?.code !== 'FULL_FETCH_RANGE_UNSUPPORTED') {
+      throw err;
+    }
+    console.warn('[Background] Ranged full download unavailable, falling back to single-stream fetch:', err?.message || err);
+    return fetchFullStreamBufferLinear(url, onProgress, baseHeaders);
+  }
 }
 
 async function fetchFullHlsStream(m3u8Url, onProgress, baseHeaders = null) {
@@ -4732,18 +4868,18 @@ const TRACK_LANG_NORMALIZE_MAP = {
   eng: 'en', enu: 'en', enus: 'en', enn: 'en', enuk: 'en', en_gb: 'en', en_gb: 'en', enus: 'en', engb: 'en', enau: 'en', enze: 'en',
   spa: 'es', esl: 'es', esu: 'es', esp: 'es', espanol: 'es', spn: 'es', es419: 'es', lat: 'es', latam: 'es', castellano: 'es',
   por: 'por', pt: 'por', porpt: 'por', pt_pt: 'por',
-  pob: 'pob', pb: 'pob', ptb: 'pob', ptbr: 'pob', pt- br: 'pob', porbr: 'pob', brazpor: 'pob', brazilian: 'pob',
-    fre: 'fr', fra: 'fr', frf: 'fr', frca: 'fr', frfr: 'fr',
-      ger: 'de', deu: 'de', gerde: 'de',
-        ita: 'it', itb: 'it',
-          rus: 'ru', rusru: 'ru',
-            chi: 'zh', zho: 'zh', cmn: 'zh', mlt: 'zh', mnd: 'zh', chs: 'zh', cht: 'zh', zhn: 'zh', zhcn: 'zh', zhtw: 'zh', zh_hans: 'zh', zh_hant: 'zh',
-              jpn: 'ja', jap: 'ja', jp: 'ja',
-                kor: 'ko', korus: 'ko', kr: 'ko',
-                  ara: 'ar', arg: 'ar', arb: 'ar', arq: 'ar',
-                    hin: 'hi', hnd: 'hi',
-                      tur: 'tr', turk: 'tr',
-                        pol: 'pl',
+  pob: 'pob', pb: 'pob', ptb: 'pob', ptbr: 'pob', 'pt-br': 'pob', porbr: 'pob', brazpor: 'pob', brazilian: 'pob',
+  fre: 'fr', fra: 'fr', frf: 'fr', frca: 'fr', frfr: 'fr',
+  ger: 'de', deu: 'de', gerde: 'de',
+  ita: 'it', itb: 'it',
+  rus: 'ru', rusru: 'ru',
+  chi: 'zh', zho: 'zh', cmn: 'zh', yue: 'zh', mnd: 'zh', chs: 'zh', cht: 'zh', zhn: 'zh', zhcn: 'zh', zhtw: 'zh', zh_hans: 'zh', zh_hant: 'zh',
+  jpn: 'ja', jap: 'ja', jp: 'ja',
+  kor: 'ko', korus: 'ko', kr: 'ko',
+  ara: 'ar', arg: 'ar', arb: 'ar', arq: 'ar',
+  hin: 'hi', hnd: 'hi',
+  tur: 'tr', turk: 'tr',
+  pol: 'pl',
                           dut: 'nl', nld: 'nl', hol: 'nl', fla: 'nl', vla: 'nl',
                             swe: 'sv', sve: 'sv',
                               nor: 'no', nob: 'no', nno: 'no', norw: 'no', bok: 'no', nyn: 'no',

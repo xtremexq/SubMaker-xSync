@@ -119,7 +119,7 @@
               <option value="disk" id="streamBufferDisk">Disk (default)</option>
               <option value="ram" id="streamBufferRam">RAM</option>
             </select>
-            <p class="hint" id="streamBufferModeHint">How large downloads are buffered. Disk is safer for big files; RAM is faster but may crash on files &gt;2 GB.</p>
+            <p class="hint" id="streamBufferModeHint">How complete-mode downloads are buffered. Disk keeps a local copy and reuses local slices for large-file recovery; RAM keeps the whole stream in memory and is more likely to fail on very large files.</p>
           </div>
         </div>
       </section>
