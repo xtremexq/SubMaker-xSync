@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## SubMaker xSync v1.0.9
+
+**Improvements:**
+
+- **Complete mode can now demux large regular MKVs from the local OPFS full download in chunked windows before falling back to targeted recovery:** after a full disk-backed download finishes, xSync can reuse the same OPFS temp file to build local subtitle windows, merge the recovered tracks, and only fall back again if that chunked pass cannot finish cleanly. This gives very large non-HLS MKVs a middle path between one-shot full demux and sparse range recovery.
+
+- **Auto Subs full-stream jobs now keep large direct files on OPFS all the way into transcription prep:** the non-HLS Cloudflare / Assembly audio-extraction path now requests disk-backed full fetches with temp-file descriptors, keeps those descriptors through background window planning, and passes OPFS-backed inputs forward instead of remapping finished `2GB+` downloads into JS `ArrayBuffer`s before FFmpeg sees them.
+
+- **Large OPFS-backed audio decode now uses the dedicated FFmpeg worker path instead of staged MEMFS copies:** when Auto Subs needs shared full-stream windows from an OPFS temp file, the offscreen page now mounts that temp file directly in the worker and decodes from there, avoiding the staged-copy branch that still had practical multi-GB limits. Demux/decode watchdog budgets now also scale with input size so long large-file runs do not time out prematurely.
+
+- **Offscreen subtitle demux now classifies text-vs-bitmap FFmpeg failures more cleanly during worker and direct extraction:** batch/sequential text extraction can skip known non-text conversion mismatches, preserve bitmap/copy streams for detection instead of logging noisy failures, and avoid unnecessary flat-cue repair inside bounded chunked passes until the merged result is evaluated.
+
+**Bug Fixes:**
+
+- **Fixed Auto Subs still failing on `2GB+` direct files after Embedded Subtitles had already been hardened:** the autosubs audio path could still hit `Full fetch final memory map failed ...` or later multi-GB transfer failures because Embedded Complete extraction had been moved to disk-backed OPFS temp files while autosubs still re-materialized the same finished download in JS memory before offscreen decode. Large direct files now stay on the disk-backed path through Cloudflare / Assembly audio extraction, matching the embedded page's safer large-file behavior.
+
+- **Fixed AssemblyAI full-video uploads rebuilding giant in-memory payloads from completed OPFS downloads:** the programmatic full-video request path now reads the finished OPFS temp file as a `File` / `Blob` for upload instead of reconstructing the entire payload as one large JS buffer first, keeping the large-file upload path consistent with the new disk-backed fetch flow.
+
+- **Fixed Embedded Complete-mode full downloads still hanging forever after a stalled network read on large files:** some real `1.4-3 GB` runs could stop making progress mid-download even though partial data had already been written to OPFS. The full-fetch reader now times out idle reads, cancels the stuck stream, and resumes with HTTP Range requests from the last committed byte instead of waiting indefinitely.
+
+- **Fixed transient OPFS disk-write failures aborting otherwise recoverable Complete-mode jobs:** when the browser lost the current writable handle during a large full download, xSync could fail the job or continue with a dead temp-file reference even though most of the file had already been written successfully. The OPFS writer now reopens with existing data preserved, re-measures the durable byte count, and resumes from that committed offset before later demux/recovery steps continue.
+
+- **Fixed regular MKV subtitle planning missing streams whose headers sat deeper in the file or used larger EBML values:** the MKV header parser now performs a deeper second-pass scan when the shallow probe finds no tracks and uses safer large-value handling for EBML sizes/IDs, reducing false `no subtitle streams` cases on larger containers.
+
+- **Fixed bitmap-only MKV subtitle jobs wasting time on OCR paths that are not implemented yet:** Complete-mode subtitle-plan preflight and the offscreen demuxer now detect image-based subtitle streams up front and stop immediately with `Image-based subtitle streams were detected, but OCR extraction is not implemented yet.` instead of attempting long OCR/Tesseract fallback work that cannot currently succeed.
+
+- **Fixed long-running extract jobs being marked failed too early in the content script:** pending extract watchdogs now stay alive for up to 60 seconds, clear as soon as progress or debug-log traffic starts, tolerate more MV3 async-port-close variants, and treat unknown extraction modes conservatively as `complete` instead of silently collapsing back to `smart`.
+
 ## SubMaker xSync v1.0.8
 
 **Improvements:**
@@ -9,12 +37,6 @@ All notable changes to this project will be documented in this file.
 - **Complete mode still downloads the full file, but no longer remaps the finished OPFS temp file back into background JS memory before demux:** Non-HLS Complete extraction now keeps the fully-downloaded stream on disk and hands an OPFS temp-file descriptor to the offscreen FFmpeg page instead of calling `file.arrayBuffer()` on the finished multi-GB temp file in the background worker. This removes the post-download `Full fetch final memory map failed ...` failure mode seen on larger files, while keeping Complete mode as a real full-file path. The offscreen demuxer can also mount the temp file via `WORKERFS` when available, reducing an additional large in-memory copy on very large streams.
 
 - **Complete-mode full downloads now recover from transient network slips instead of restarting from byte 0:** The OPFS-backed full-fetch path now treats mid-stream read failures as resumable events, waits briefly, and retries up to 3 times using HTTP Range requests from the last successfully written byte. This means a failure around `200-300 MB` no longer forces Complete mode to throw away the whole partial download immediately before recovery even starts.
-
-- **Mounted OPFS demuxes now get a dedicated FFmpeg-worker path before falling back to the direct offscreen core:** xSync can boot a separate demux worker for mounted-file extraction, batch text subtitle conversion more aggressively, and keep bitmap/copy tracks available for OCR fallback without immediately forcing a staged copy back through the main offscreen page.
-
-- **Sync and auto-sub now stop for explicit multi-audio track selection instead of silently committing to the first stream:** When a container exposes multiple audio tracks, xSync can surface the choices back to the page, resume once the user picks a stream, and carry the chosen track language through the Cloudflare / AssemblyAI setup path more consistently.
-
-- **MV3 background startup now preloads ALASS / ffsubsync WebAssembly modules during bootstrap:** The service worker eagerly imports the required wasm wrappers/glue while it is first evaluated, avoiding late `importScripts()` / CSP edge cases that could leave advanced sync engines unavailable after a cold wake-up.
 
 - **Embedded demux now preserves trusted subtitle language metadata more consistently across extraction modes:** MKV/MP4 header probing is used more aggressively, exact/regional tags are normalized more reliably (`pt-BR`, `pt-PT`, `es-419`, `zh-Hans`, `zh-Hant`, etc.), and content-based language guesses are treated as a weak fallback instead of a peer to real container metadata.
 
@@ -29,10 +51,6 @@ All notable changes to this project will be documented in this file.
 - **Fixed label/content guessing and exact-tag normalization holes causing wrong-language carryover across the extraction pipeline:** xSync now normalizes exact BCP-47-ish forms before collapsing to the base subtag and avoids letting generated labels, placeholder names, or weak guesses outrank trusted metadata during later extraction/result-merging steps.
 
 - **Fixed offscreen FFmpeg cleanup around early returns, cancellations, and fallback paths:** The offscreen demux/document flow now cleans up staged input files, extracted temp outputs, and mounted OPFS inputs more reliably so failed retries, OCR fallbacks, and cancelled jobs do not leave FFmpeg filesystem artifacts behind across runs.
-
-- **Fixed extracted text subtitle tracks from some containers coming back with flat or non-monotonic cue timelines:** xSync now detects obviously broken timestamp shapes, retries text extraction with PTS normalization, and can remux/reconvert only the affected subtitle streams before returning the final tracks.
-
-- **Fixed sync / auto-sub choosing the wrong audio stream or carrying the wrong language hint on multi-track media:** Track preference now pauses for user choice when needed, reuses the selected stream across retries, and normalizes provider-specific language tags more reliably before transcription requests are built.
 
 ## SubMaker xSync v1.0.7
 

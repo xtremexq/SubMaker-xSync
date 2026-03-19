@@ -244,6 +244,64 @@ function waitWithAbort(ms, signal) {
   });
 }
 
+function createReadIdleTimeoutError(timeoutMs) {
+  const safeTimeoutMs = Math.max(1000, Number(timeoutMs) || 0);
+  const seconds = Math.round(safeTimeoutMs / 1000);
+  const err = new Error(`Connection stalled for ${seconds}s without receiving data`);
+  err.name = 'ReadIdleTimeoutError';
+  err.code = 'READ_IDLE_TIMEOUT';
+  err.timeoutMs = safeTimeoutMs;
+  return err;
+}
+
+function isReadIdleTimeoutError(err) {
+  return !!err && (err.code === 'READ_IDLE_TIMEOUT' || err.name === 'ReadIdleTimeoutError');
+}
+
+async function readReaderChunkWithIdleTimeout(reader, idleTimeoutMs, signal) {
+  const timeoutMs = Math.max(15000, Number(idleTimeoutMs) || 120000);
+  let timer = null;
+  let abortHandler = null;
+
+  try {
+    return await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (signal && abortHandler) {
+          try { signal.removeEventListener('abort', abortHandler); } catch (_) { /* ignore */ }
+        }
+        fn(value);
+      };
+
+      timer = setTimeout(() => finish(reject, createReadIdleTimeoutError(timeoutMs)), timeoutMs);
+
+      if (signal) {
+        if (signal.aborted) {
+          finish(reject, createAbortError(signal.reason || 'Operation aborted'));
+          return;
+        }
+        abortHandler = () => finish(reject, createAbortError(signal.reason || 'Operation aborted'));
+        signal.addEventListener('abort', abortHandler, { once: true });
+      }
+
+      Promise.resolve()
+        .then(() => reader.read())
+        .then(
+          (value) => finish(resolve, value),
+          (error) => finish(reject, error)
+        );
+    });
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (signal && abortHandler) {
+      try { signal.removeEventListener('abort', abortHandler); } catch (_) { /* ignore */ }
+    }
+  }
+}
+
 function requestOffscreenCancel(messageId, reason = 'Operation cancelled') {
   if (!messageId) return;
   try {
@@ -362,7 +420,8 @@ function normalizeExtractMode(mode) {
     .replace(/[-_\s]+/g, '-');      // align separators for comparisons
   if (cleaned === 'complete' || cleaned === 'full' || cleaned === 'fullfetch') return 'complete';
   if (cleaned === 'smart') return 'smart';
-  return 'smart';
+  if (cleaned === 'chunked-progressive-opfs-demux') return 'chunked-progressive-opfs-demux';
+  return 'complete';
 }
 
 // Preload the IDB transfer helper at boot so MV3 doesn't block late importScripts calls.
@@ -1937,15 +1996,13 @@ function __xsyncHandleMessage(message, sender, sendResponse) {
       handleExtractSubsRequest(message, sender.tab?.id, 'single')
         .then((result) => {
           console.log('[Background] Extract completed:', { success: result.success, trackCount: result.tracks?.length });
-          reply(result);
         })
         .catch((error) => {
           console.error('[Background] Extract error:', error);
-          const errorMsg = error?.message || 'Unknown error';
           console.error('[Background] Full error stack:', error?.stack);
-          reply({ success: false, error: errorMsg });
         });
-      return true;
+      reply({ success: true, accepted: true, messageId: message.messageId });
+      return false;
     }
 
     console.warn('[Background] Unhandled message type:', message.type);
@@ -2332,6 +2389,24 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
   if (ctx?.tabId && baseHeaders) {
     sendDebugLog(ctx.tabId, ctx.messageId, `Using page headers for extract (referer=${baseHeaders.Referer ? 'yes' : 'no'}, ua=${baseHeaders['User-Agent'] ? 'yes' : 'no'}, cookies=${baseHeaders.Cookie ? 'yes' : 'no'})`, 'info');
   }
+  const tempFilesToCleanup = new Set();
+  const rememberTempFile = (result) => {
+    if (result?.opfsTempName) {
+      tempFilesToCleanup.add(String(result.opfsTempName || '').trim());
+    }
+    return result;
+  };
+  const cleanupFailedFullFetch = async (err) => {
+    if (err?.partialOpfsTempName) {
+      await cleanupOpfsTempFile(err.partialOpfsTempName);
+    }
+  };
+  const fullFetchOptions = {
+    streamBufferMode: 'disk',
+    returnTempFile: true,
+    networkReadRetries: 3,
+    retryBaseDelayMs: 1500
+  };
 
   try {
     const isHls = /\.m3u8(\?|$)/i.test(streamUrl);
@@ -2386,11 +2461,16 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
       const statusMsg = 'Complete mode: downloading full stream...';
       try {
         onProgress(10, statusMsg);
-        const full = await fetchFullStream(streamUrl, (p) => onProgress(10 + p * 0.4, statusMsg), baseHeaders);
+        const full = rememberTempFile(await fetchFullStream(
+          streamUrl,
+          (p) => onProgress(10 + p * 0.4, statusMsg),
+          baseHeaders,
+          fullFetchOptions
+        ));
         const fullBuf = full?.buffer || full;
-        const probedDur = probeContainerDuration(fullBuf);
-        const estimatedDur = !probedDur && fullBuf?.byteLength
-          ? estimateDurationFromBytes(fullBuf.byteLength)
+        const probedDur = await probeDurationFromMediaSource(fullBuf);
+        const estimatedDur = !probedDur
+          ? estimateDurationFromBytes(getMediaSourceByteLength(fullBuf))
           : null;
         sample = {
           ...full,
@@ -2403,11 +2483,13 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
         }
         fullFetchedUpfront = true;
         if (ctx?.tabId) {
-          const sizeMb = fullBuf?.byteLength ? Math.round(fullBuf.byteLength / (1024 * 1024)) : 'unknown';
+          const fullBytes = getMediaSourceByteLength(fullBuf);
+          const sizeMb = fullBytes ? Math.round(fullBytes / (1024 * 1024)) : 'unknown';
           const durSource = probedDur ? 'container' : (estimatedDur ? 'estimated from size' : 'none');
           sendDebugLog(ctx.tabId, ctx.messageId, `Complete mode: fetched full stream first (~${sizeMb} MB, duration source: ${durSource})`, 'info');
         }
       } catch (fullErr) {
+        await cleanupFailedFullFetch(fullErr);
         console.warn('[Background] Upfront full fetch failed, falling back to ranged sample:', fullErr?.message || fullErr);
         if (ctx?.tabId) {
           sendDebugLog(ctx.tabId, ctx.messageId, `Full fetch upfront failed (${fullErr?.message || fullErr}); falling back to range sample`, 'warn');
@@ -2442,11 +2524,16 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
       if (allowFullFetch) {
         const statusMsg = 'Sample looks partial; downloading full stream for complete coverage...';
         try {
-          const full = await fetchFullStream(streamUrl, (p) => onProgress(48 + p * 0.18, statusMsg), baseHeaders);
+          const full = rememberTempFile(await fetchFullStream(
+            streamUrl,
+            (p) => onProgress(48 + p * 0.18, statusMsg),
+            baseHeaders,
+            fullFetchOptions
+          ));
           const fullBuf = full?.buffer || full;
-          const probedDur = probeContainerDuration(fullBuf);
-          const estimatedDur = !probedDur && fullBuf?.byteLength
-            ? estimateDurationFromBytes(fullBuf.byteLength)
+          const probedDur = await probeDurationFromMediaSource(fullBuf);
+          const estimatedDur = !probedDur
+            ? estimateDurationFromBytes(getMediaSourceByteLength(fullBuf))
             : null;
           sample = {
             ...sample,
@@ -2460,11 +2547,13 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
             detectedDuration = sample.durationSec;
           }
           if (ctx?.tabId) {
-            const sizeMb = fullBuf?.byteLength ? Math.round(fullBuf.byteLength / (1024 * 1024)) : 'unknown';
+            const fullBytes = getMediaSourceByteLength(fullBuf);
+            const sizeMb = fullBytes ? Math.round(fullBytes / (1024 * 1024)) : 'unknown';
             const durSource = probedDur ? 'container' : (estimatedDur ? 'estimated' : 'none');
             sendDebugLog(ctx.tabId, ctx.messageId, `Full stream fetched (~${sizeMb} MB, dur: ${durSource}); continuing with complete buffer`, 'info');
           }
         } catch (fullErr) {
+          await cleanupFailedFullFetch(fullErr);
           console.warn('[Background] Full fetch fallback failed:', fullErr?.message || fullErr);
           if (ctx?.tabId) {
             sendDebugLog(ctx.tabId, ctx.messageId, `Full fetch fallback failed: ${fullErr?.message || fullErr}`, 'error');
@@ -2508,9 +2597,10 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
       const windows = [];
       const fallbackHead = (specs?.[0]?.durSec || effectivePlan?.windowSeconds || 60);
       const coverageHint = headSample?.partial ? headCoverageSec : null;
+      const probedHeadDuration = await probeDurationFromMediaSource(headSample?.buffer);
       const headDuration = coverageHint
         || headSample?.durationSec
-        || probeContainerDuration(headSample?.buffer)
+        || probedHeadDuration
         || totalDurationSec
         || fallbackHead;
       const clampSeek = (desired, available) => {
@@ -2629,7 +2719,12 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
     const fullFetchRetry = async (reasonLabel) => {
       const statusMsg = reasonLabel || 'Retrying audio decode with full stream...';
       try {
-        const full = await fetchFullStream(streamUrl, (p) => onProgress(70 + p * 0.15, statusMsg), baseHeaders);
+        const full = rememberTempFile(await fetchFullStream(
+          streamUrl,
+          (p) => onProgress(70 + p * 0.15, statusMsg),
+          baseHeaders,
+          fullFetchOptions
+        ));
         const fullBuf = full?.buffer || full;
         sample = {
           ...sample,
@@ -2637,7 +2732,7 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
           buffer: fullBuf,
           partial: false,
           totalBytes: full?.totalBytes || sample?.totalBytes || null,
-          durationSec: probeContainerDuration(fullBuf) || sample?.durationSec || detectedDuration || null
+          durationSec: await probeDurationFromMediaSource(fullBuf) || sample?.durationSec || detectedDuration || null
         };
         if (sample?.durationSec && !detectedDuration) {
           detectedDuration = sample.durationSec;
@@ -2650,6 +2745,7 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
         audioWindows = await tryDecode(sample, 85, 0.12, statusMsg);
         decodeError = null;
       } catch (fullErr) {
+        await cleanupFailedFullFetch(fullErr);
         decodeError = fullErr;
         if (ctx?.tabId) {
           sendDebugLog(ctx.tabId, ctx.messageId, `Full-fetch retry failed: ${fullErr?.message || fullErr}`, 'error');
@@ -2657,7 +2753,13 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
       }
     };
 
-    const sampleFullyFetched = sample?.partial === false && (!sample?.totalBytes || !sample?.buffer?.byteLength || sample.buffer.byteLength >= sample.totalBytes * 0.98);
+    const sampleBufferBytes = getMediaSourceByteLength(sample?.buffer) || sample?.byteLength || 0;
+    const sampleFullyFetched = sample?.partial === false && (
+      isOpfsTempDemuxSource(sample?.buffer)
+      || !sample?.totalBytes
+      || !sampleBufferBytes
+      || sampleBufferBytes >= sample.totalBytes * 0.98
+    );
     if (decodeError && !sampleFullyFetched) {
       if (ctx?.tabId) {
         sendDebugLog(ctx.tabId, ctx.messageId, `Decode failed (${decodeError?.message || decodeError}); retrying after full fetch...`, 'warn');
@@ -2683,6 +2785,10 @@ async function extractAudioFromStream(streamUrl, planInput, onProgress, ctx = nu
   } catch (error) {
     console.error('[Background] Audio extraction failed:', error);
     throw new Error(`Audio extraction failed: ${error.message}`);
+  } finally {
+    for (const tempName of tempFilesToCleanup) {
+      await cleanupOpfsTempFile(tempName);
+    }
   }
 }
 
@@ -3244,6 +3350,7 @@ async function handleAssemblyAutoSubRequest(message, tabId) {
 
   const logToPage = (text, level = 'info') => sendDebugLog(tabId, messageId, text, level);
   const progress = (pct, status, stage = 'info', level = 'info') => sendAutoSubProgress(tabId, messageId, pct, status, stage, level);
+  let opfsUploadTempName = '';
 
   try {
     const baseHeaders = buildHeadersFromPage(pageHeaders);
@@ -3296,9 +3403,25 @@ async function handleAssemblyAutoSubRequest(message, tabId) {
         uploadBlob = new Blob([full.buffer], { type: full.contentType || 'video/mp2t' });
         contentType = uploadBlob.type || full.contentType || 'video/mp2t';
       } else {
-        const full = await fetchFullStream(streamUrl, (p) => progress(Math.min(60, p), 'Fetching full stream...', 'fetch'), baseHeaders);
-        uploadBlob = new Blob([full.buffer], { type: full.contentType || 'video/mp4' });
-        contentType = uploadBlob.type || full.contentType || 'video/mp4';
+        const full = await fetchFullStream(
+          streamUrl,
+          (p) => progress(Math.min(60, p), 'Fetching full stream...', 'fetch'),
+          baseHeaders,
+          {
+            streamBufferMode: 'disk',
+            returnTempFile: true,
+            networkReadRetries: 3,
+            retryBaseDelayMs: 1500
+          }
+        );
+        if (full?.opfsTempName) {
+          opfsUploadTempName = String(full.opfsTempName || '').trim();
+          uploadBlob = await readOpfsTempFileBlob(opfsUploadTempName);
+          contentType = uploadBlob?.type || full.contentType || 'video/mp4';
+        } else {
+          uploadBlob = new Blob([full.buffer], { type: full.contentType || 'video/mp4' });
+          contentType = uploadBlob.type || full.contentType || 'video/mp4';
+        }
       }
     } else {
       const planInput = {
@@ -3405,10 +3528,17 @@ async function handleAssemblyAutoSubRequest(message, tabId) {
     clearAutoSubTrackChoice(messageId);
     return payload;
   } catch (error) {
+    if (error?.partialOpfsTempName) {
+      await cleanupOpfsTempFile(error.partialOpfsTempName);
+    }
     progress(100, `AssemblyAI failed: ${error?.message || error}`, 'error', 'error');
     sendAutoSubResult(tabId, messageId, { success: false, error: error?.message || 'AssemblyAI transcription failed' });
     clearAutoSubTrackChoice(messageId);
     return { success: false, error: error?.message || 'AssemblyAI transcription failed' };
+  } finally {
+    if (opfsUploadTempName) {
+      await cleanupOpfsTempFile(opfsUploadTempName);
+    }
   }
 }
 /**
@@ -3655,6 +3785,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
   const normalizedMode = normalizeExtractMode(mode);
   const isCompleteMode = normalizedMode === 'complete';
   const isSmartMode = normalizedMode === 'smart';
+  const isChunkedProgressiveOpfsMode = normalizedMode === EXTRACT_MODE_CHUNKED_PROGRESSIVE_OPFS_DEMUX;
   const lowerUrl = String(streamUrl || '').toLowerCase();
   const hostLabel = (() => { try { return new URL(streamUrl).hostname; } catch (_) { return streamUrl; } })();
   const extractionMode = normalizedMode;
@@ -3702,11 +3833,29 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
     throw new Error('DASH manifest detected but no extractable text tracks were found.');
   }
 
+  if (isChunkedProgressiveOpfsMode) {
+    return extractChunkedProgressiveOpfsDemux(streamUrl, tabId, messageId, hints);
+  }
+
   // Smart mode: single-pass, fast path. If completeness is uncertain, fail and ask user to use Complete mode.
   if (isSmartMode) {
     const modeLabel = 'Smart';
+    const prefix = `${modeLabel} could not produce complete subtitles`;
+    const hint = 'Please switch to Complete Mode.';
+    const isSmartFailureMessage = (value) => String(value || '').trim().startsWith(prefix);
     const failSmart = (reason) => {
-      const msg = `${modeLabel} could not produce complete subtitles${reason ? ` (${reason})` : ''}. Please switch to Complete Mode.`;
+      let detail = String(reason || '').trim();
+      if (detail.startsWith(prefix)) {
+        detail = detail.slice(prefix.length).trim();
+      }
+      if (detail.endsWith(hint)) {
+        detail = detail.slice(0, -hint.length).trim();
+      }
+      detail = detail.replace(/^[\s:.-]+/, '').trim();
+      if (detail.startsWith('(') && detail.endsWith(')')) {
+        detail = detail.slice(1, -1).trim();
+      }
+      const msg = `${prefix}${detail ? ` (${detail})` : ''}. ${hint}`;
       sendDebugLog(tabId, messageId, msg, 'error');
       throw new Error(msg);
     };
@@ -3743,6 +3892,7 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
       } catch (vErr) {
         if (isAbortError(vErr)) throw vErr;
         const reason = vErr?.message || vErr;
+        if (isSmartFailureMessage(reason)) throw vErr;
         sendDebugLog(tabId, messageId, `${modeLabel} video extraction failed (${reason})`, 'warn');
         failSmart('video element path unavailable');
       }
@@ -3778,7 +3928,9 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
       return tracks;
     } catch (dErr) {
       if (isAbortError(dErr)) throw dErr;
-      failSmart(`demux failed (${dErr?.message || dErr})`);
+      const reason = dErr?.message || dErr;
+      if (isSmartFailureMessage(reason)) throw dErr;
+      failSmart(`demux failed (${reason})`);
     }
   }
 
@@ -3827,7 +3979,11 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
               const progressLabel = retryTotalBytes
                 ? `${formatByteCount(receivedBytes)} of ${formatByteCount(retryTotalBytes)}`
                 : formatByteCount(receivedBytes);
-              const phaseLabel = phase === 'resume request' ? 'resume' : 'read';
+              const phaseLabel = phase === 'resume request'
+                ? 'resume'
+                : phase === 'disk write'
+                  ? 'disk write'
+                  : 'read';
               sendDebugLog(
                 tabId,
                 messageId,
@@ -3841,7 +3997,8 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
       if (isAbortError(fullErr)) throw fullErr;
       if (!isHls) {
         const fullMsg = fullErr?.message || String(fullErr);
-        sendDebugLog(tabId, messageId, `Complete full download failed (${fullMsg}); trying range-based recovery...`, 'warn');
+        sendDebugLog(tabId, messageId, `Complete full download failed: ${fullMsg}`, 'warn');
+        sendDebugLog(tabId, messageId, 'Complete: switching to range-based recovery.', 'warn');
         const partialRecoverySeed = fullErr?.partialOpfsTempName && fullErr?.partialBytes
           ? {
             opfsTempName: String(fullErr.partialOpfsTempName || ''),
@@ -3887,38 +4044,84 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
     const fullBuffer = full?.buffer || full;
     const fullBytes = full?.byteLength || full?.totalBytes || fullBuffer?.byteLength || 0;
     const fullMb = Math.round((fullBytes / (1024 * 1024)) * 10) / 10;
+    const fullLooksMkv = !isHls
+      && !!full?.opfsTempName
+      && isLikelyMkv(streamUrl, completeProbe?.contentType || full?.contentType || '', completeProbe?.buffer || null);
     try {
-      if (!isHls && full?.opfsTempName && shouldAvoidDirectOpfsFullDemux(fullBytes)) {
+      if (fullLooksMkv) {
+        try {
+          const preflightHeadBuffer = completeProbe?.buffer?.byteLength
+            ? completeProbe.buffer
+            : (await materializeOpfsRecoveryHeadSample(full, 24 * 1024 * 1024, 24 * 1024 * 1024))?.buffer;
+          if (preflightHeadBuffer?.byteLength) {
+            const headerInfo = parseMkvHeaderInfo(
+              preflightHeadBuffer,
+              { maxScanBytes: Math.min(preflightHeadBuffer.byteLength, 24 * 1024 * 1024) || 24 * 1024 * 1024 }
+            );
+            const subtitleKindSummary = summarizeMkvSubtitleTrackKinds(headerInfo);
+            if (subtitleKindSummary.bitmapOnly) {
+              throwBitmapSubtitleOcrNotImplemented(tabId, messageId, subtitleKindSummary, 'the MKV subtitle plan');
+            }
+          }
+        } catch (bitmapPlanErr) {
+          if (isAbortError(bitmapPlanErr)) throw bitmapPlanErr;
+          if (String(bitmapPlanErr?.message || bitmapPlanErr) === BITMAP_SUBTITLE_OCR_NOT_IMPLEMENTED_MESSAGE) {
+            throw bitmapPlanErr;
+          }
+          sendDebugLog(
+            tabId,
+            messageId,
+            `Complete: unable to preflight bitmap-only subtitle plan before demux (${bitmapPlanErr?.message || bitmapPlanErr}); continuing...`,
+            'warn'
+          );
+        }
+      }
+
+      if (!isHls && full?.opfsTempName && fullLooksMkv && shouldAvoidDirectOpfsFullDemux(fullBytes)) {
         sendDebugLog(
           tabId,
           messageId,
-          `Complete: full stream download finished (~${fullMb || '?'} MB), but direct FFmpeg demux would need to stage the whole file in memory. Switching to targeted recovery instead.`,
+          `Complete: full stream download finished (~${fullMb || '?'} MB). Large regular MKV detected; trying chunked local OPFS demux before direct full demux.`,
           'warn'
         );
-        sendExtractProgress(tabId, messageId, 95, 'Complete: recovering subtitles from the downloaded head slice...');
-        const recovered = await tryCompleteModeRangeRecovery({
-          streamUrl,
-          messageId,
-          tabId,
-          hostLabel,
-          baseHeaders,
-          initialSample: full,
-          signal
-        });
-        if (recovered?.tracks?.length) {
-          const tracks = applyLangHints(recovered.tracks, full?.subtitleLangs || hints?.subtitleLangs);
-          const summary = summarizeTracks(tracks);
-          const lastCueText = summary?.lastCueSec ? `; last cue at ${Math.round(summary.lastCueSec)}s` : '';
-          sendExtractProgress(tabId, messageId, 100, `Complete: recovered ${tracks.length} track(s) after avoiding oversized full demux${lastCueText}`);
-          return tracks;
+        sendExtractProgress(tabId, messageId, 95, 'Complete: merging subtitles from local OPFS windows...');
+        try {
+          const chunkedTracks = await extractChunkedProgressiveOpfsDemuxFromLocalOpfs({
+            streamUrl,
+            tabId,
+            messageId,
+            hints,
+            baseHeaders,
+            hostLabel,
+            preflightSample: completeProbe,
+            full
+          });
+          if (chunkedTracks?.length) {
+            const tracks = applyLangHints(chunkedTracks, full?.subtitleLangs || hints?.subtitleLangs);
+            const summary = summarizeTracks(tracks);
+            const lastCueText = summary?.lastCueSec ? `; last cue at ${Math.round(summary.lastCueSec)}s` : '';
+            sendExtractProgress(tabId, messageId, 100, `Complete: merged ${tracks.length} track(s) via chunked local OPFS demux${lastCueText}`);
+            return tracks;
+          }
+        } catch (chunkedErr) {
+          if (isAbortError(chunkedErr)) throw chunkedErr;
+          sendDebugLog(
+            tabId,
+            messageId,
+            `Complete chunked local OPFS backend failed (${chunkedErr?.message || chunkedErr}); continuing to direct full demux.`,
+            'warn'
+          );
         }
-        throw new Error(`Complete recovery could not replace direct full demux for the ~${fullMb || '?'} MB stream.`);
       }
 
       sendDebugLog(tabId, messageId, `Complete: fetched full stream (~${fullMb || '?'} MB). Demuxing...`, 'info');
       sendExtractProgress(tabId, messageId, 95, 'Complete: demuxing full stream...');
       try {
-        const tracks = applyLangHints(await demuxSubtitlesOffscreen(fullBuffer, messageId, tabId, { signal }), full?.subtitleLangs || hints?.subtitleLangs);
+        const tracks = applyLangHints(await demuxSubtitlesOffscreen(fullBuffer, messageId, tabId, {
+          signal,
+          keepaliveProgress: 95,
+          keepaliveStatus: 'Complete: demuxing full stream...'
+        }), full?.subtitleLangs || hints?.subtitleLangs);
         if (!tracks || !tracks.length) {
           throw new Error('Complete demux returned no tracks');
         }
@@ -3928,7 +4131,33 @@ async function extractEmbeddedSubtitles(streamUrl, mode, tabId, messageId, hints
         return tracks;
       } catch (demuxErr) {
         if (!isHls && full?.opfsTempName && isRecoverableOpfsDemuxFailure(demuxErr)) {
-          sendDebugLog(tabId, messageId, `Complete full demux failed (${demuxErr?.message || demuxErr}); retrying via targeted recovery...`, 'warn');
+          if (fullLooksMkv) {
+            sendDebugLog(tabId, messageId, `Complete full demux failed (${demuxErr?.message || demuxErr}); retrying via chunked local OPFS demux...`, 'warn');
+            try {
+              const chunkedTracks = await extractChunkedProgressiveOpfsDemuxFromLocalOpfs({
+                streamUrl,
+                tabId,
+                messageId,
+                hints,
+                baseHeaders,
+                hostLabel,
+                preflightSample: completeProbe,
+                full
+              });
+              if (chunkedTracks?.length) {
+                const tracks = applyLangHints(chunkedTracks, full?.subtitleLangs || hints?.subtitleLangs);
+                const summary = summarizeTracks(tracks);
+                const lastCueText = summary?.lastCueSec ? `; last cue at ${Math.round(summary.lastCueSec)}s` : '';
+                sendExtractProgress(tabId, messageId, 100, `Complete: merged ${tracks.length} track(s) via chunked local OPFS fallback${lastCueText}`);
+                return tracks;
+              }
+            } catch (chunkedErr) {
+              if (isAbortError(chunkedErr)) throw chunkedErr;
+              sendDebugLog(tabId, messageId, `Complete chunked local OPFS fallback failed (${chunkedErr?.message || chunkedErr}); retrying via targeted recovery...`, 'warn');
+            }
+          } else {
+            sendDebugLog(tabId, messageId, `Complete full demux failed (${demuxErr?.message || demuxErr}); retrying via targeted recovery...`, 'warn');
+          }
           const recovered = await tryCompleteModeRangeRecovery({
             streamUrl,
             messageId,
@@ -4333,6 +4562,9 @@ async function decodeWindowsOffscreen(windows, mode, onProgress, ctx = null, opt
   try {
     await ensureOffscreenDocument();
     const messageId = `adecode_${Date.now()}`;
+    const maxWindowBytes = (windows || []).reduce((max, win) => Math.max(max, getMediaSourceByteLength(win?.buffer)), 0);
+    const hasOpfsWindow = (windows || []).some((win) => isOpfsTempDemuxSource(win?.buffer));
+    const decodeTimeoutMs = computeBackgroundOffscreenDemuxTimeoutMs(maxWindowBytes, hasOpfsWindow);
 
     const prepared = [];
     const sharedBuffers = new WeakMap();
@@ -4340,11 +4572,36 @@ async function decodeWindowsOffscreen(windows, mode, onProgress, ctx = null, opt
     let idbBuffers = 0;
     let chunkedBuffers = 0;
     let directBuffers = 0;
+    let opfsBuffers = 0;
     let reusedBuffers = 0;
     logToPage(`Offscreen decode starting (${windows.length} window(s)); chunkBytes=${OFFSCREEN_CHUNK_BYTES}`, 'info');
 
     for (let i = 0; i < windows.length; i++) {
       const win = windows[i];
+      const opfsSource = buildOpfsTempTransferDescriptor(win.buffer);
+      if (opfsSource) {
+        const cacheKey = win.buffer;
+        const cached = sharedBuffers.get(cacheKey);
+        const preparedOpfs = cached?.opfsSource || opfsSource;
+        if (!cached) {
+          sharedBuffers.set(cacheKey, { opfsSource: preparedOpfs, transferMethod: 'opfs' });
+          opfsBuffers += 1;
+          const sizeMb = Math.round((preparedOpfs.byteLength / (1024 * 1024)) * 10) / 10;
+          logToPage(`Prepared OPFS temp input for window #${i + 1} (~${sizeMb} MB) -> ${preparedOpfs.opfsTempName}`, 'info');
+        } else {
+          reusedBuffers += 1;
+          logToPage(`Reusing shared buffer for window #${i + 1} (opfs)`, 'debug');
+        }
+        prepared.push({
+          buffer: preparedOpfs,
+          transferMethod: 'opfs',
+          startSec: win.startSec,
+          durSec: win.durSec,
+          seekToSec: win.seekToSec
+        });
+        continue;
+      }
+
       let buffer = normalizeBufferForTransfer(win.buffer);
       if (!buffer) continue;
       if (buffer instanceof Blob) {
@@ -4408,11 +4665,11 @@ async function decodeWindowsOffscreen(windows, mode, onProgress, ctx = null, opt
       throw new Error('No audio windows to send to offscreen decoder');
     }
     logToPage(
-      `Prepared ${prepared.length}/${windows.length} window(s) for offscreen decode (idb=${idbBuffers}, chunked=${chunkedBuffers}, direct=${directBuffers}, reused=${reusedBuffers})`,
+      `Prepared ${prepared.length}/${windows.length} window(s) for offscreen decode (opfs=${opfsBuffers}, idb=${idbBuffers}, chunked=${chunkedBuffers}, direct=${directBuffers}, reused=${reusedBuffers})`,
       'info'
     );
 
-    const { promise, cancel } = waitForOffscreenResult(messageId, 240000);
+    const { promise, cancel } = waitForOffscreenResult(messageId, decodeTimeoutMs + 20000);
     const payload = {
       type: 'OFFSCREEN_FFMPEG_DECODE',
       messageId,
@@ -6598,6 +6855,283 @@ function analyzeCueTimelines(tracks) {
   return { flatCueStarts, nonMonotonicCues };
 }
 
+function normalizeSubtitleMergeText(text) {
+  return String(text || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .join('\n')
+    .trim();
+}
+
+function buildSubtitleCueTimeKey(startSec, endSec) {
+  const startMs = Math.max(0, Math.round((Number.isFinite(startSec) ? startSec : 0) * 1000));
+  const endMs = Math.max(startMs, Math.round((Number.isFinite(endSec) ? endSec : startMs / 1000) * 1000));
+  return `${startMs}-${endMs}`;
+}
+
+function formatSrtTimestampForMerge(sec) {
+  const clamped = Math.max(0, Number.isFinite(sec) ? sec : 0);
+  const msTotal = Math.round(clamped * 1000);
+  const ms = msTotal % 1000;
+  const totalSeconds = (msTotal - ms) / 1000;
+  const s = totalSeconds % 60;
+  const totalMinutes = (totalSeconds - s) / 60;
+  const m = totalMinutes % 60;
+  const h = (totalMinutes - m) / 60;
+  const pad = (value, len = 2) => String(value).padStart(len, '0');
+  return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms, 3)}`;
+}
+
+function parseSrtLikeCueBlocks(content) {
+  const normalized = String(content || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/\r/g, '');
+  if (!normalized.trim()) return [];
+
+  const lines = normalized.split('\n');
+  const cues = [];
+  let index = 0;
+  let order = 0;
+
+  while (index < lines.length) {
+    while (index < lines.length && !lines[index].trim()) {
+      index += 1;
+    }
+    if (index >= lines.length) break;
+
+    if (/^WEBVTT\b/i.test(lines[index].trim())) {
+      index += 1;
+      continue;
+    }
+
+    let timeLine = lines[index];
+    if (/^\d+$/.test(lines[index].trim()) && index + 1 < lines.length && /-->/.test(lines[index + 1])) {
+      index += 1;
+      timeLine = lines[index];
+    }
+    if (!/-->/.test(timeLine || '')) {
+      index += 1;
+      continue;
+    }
+
+    const match = String(timeLine || '').match(/^\s*(\d+:\d{2}:\d{2}[,.]\d{1,3})\s+-->\s+(\d+:\d{2}:\d{2}[,.]\d{1,3})/);
+    if (!match) {
+      index += 1;
+      continue;
+    }
+
+    const startSec = parseArrowSubtitleTimeToSeconds(match[1]);
+    const endSec = parseArrowSubtitleTimeToSeconds(match[2]);
+    index += 1;
+
+    const textLines = [];
+    while (index < lines.length && lines[index].trim() !== '') {
+      textLines.push(lines[index]);
+      index += 1;
+    }
+
+    if (startSec === null || endSec === null) {
+      continue;
+    }
+
+    cues.push({
+      startSec,
+      endSec,
+      text: textLines.join('\n').trim(),
+      order: order++
+    });
+  }
+
+  return cues;
+}
+
+function serializeSrtLikeCueBlocks(cues) {
+  return (cues || []).map((cue, index) => {
+    const start = formatSrtTimestampForMerge(cue.startSec);
+    const end = formatSrtTimestampForMerge(cue.endSec);
+    const text = String(cue.text || '').trim();
+    return `${index + 1}\n${start} --> ${end}\n${text}\n`;
+  }).join('\n');
+}
+
+function parseAssDialogueEntries(content) {
+  const normalized = String(content || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/\r/g, '');
+  if (!normalized.trim()) {
+    return { header: '', entries: [] };
+  }
+
+  const firstDialogueMatch = normalized.match(/^Dialogue:.*$/m);
+  const firstDialogueIndex = firstDialogueMatch?.index ?? -1;
+  const header = firstDialogueIndex >= 0
+    ? normalized.slice(0, firstDialogueIndex).trimEnd()
+    : normalized.trimEnd();
+
+  const dialogueRegex = /^Dialogue:\s*([^,]*),\s*([^,]+),\s*([^,]+),(.*)$/gmi;
+  const entries = [];
+  let match;
+  let order = 0;
+  while ((match = dialogueRegex.exec(normalized)) !== null) {
+    const startSec = parseAssSubtitleTimeToSeconds(match[2]);
+    const endSec = parseAssSubtitleTimeToSeconds(match[3]);
+    if (startSec === null || endSec === null) {
+      continue;
+    }
+    const remainder = String(match[4] || '').trim();
+    entries.push({
+      startSec,
+      endSec,
+      remainder,
+      raw: match[0].trim(),
+      key: `${buildSubtitleCueTimeKey(startSec, endSec)}|${normalizeSubtitleMergeText(remainder)}`,
+      order: order++
+    });
+  }
+
+  return {
+    header: header ? `${header}\n` : '',
+    entries
+  };
+}
+
+function serializeMergedAssTrack(header, entries) {
+  const prefix = header ? (header.endsWith('\n') ? header : `${header}\n`) : '';
+  const body = (entries || []).map((entry) => String(entry.raw || '').trim()).filter(Boolean).join('\n');
+  if (!body) {
+    return prefix.trim() ? prefix : '';
+  }
+  return `${prefix}${body}\n`;
+}
+
+function buildChunkedTrackMergeKey(track) {
+  const id = String(track?.id || '').trim();
+  if (id) return `id:${id}`;
+  const label = String(track?.label || '').trim().toLowerCase();
+  const codec = normalizeSubtitleFormatHint(track?.codec, track?.mime);
+  const language = String(track?.language || 'und').trim().toLowerCase();
+  return `meta:${label}|${codec}|${language}`;
+}
+
+function createChunkedTrackAccumulator(track) {
+  const codec = normalizeSubtitleFormatHint(track?.codec, track?.mime);
+  const kind = codec === 'ass' || codec === 'ssa' ? 'ass' : 'srt';
+  return {
+    key: buildChunkedTrackMergeKey(track),
+    id: String(track?.id || ''),
+    label: track?.label || '',
+    language: track?.language || 'und',
+    codec,
+    mime: track?.mime || (codec === 'vtt' ? 'text/vtt; charset=utf-8' : codec === 'ass' || codec === 'ssa' ? 'text/x-ssa; charset=utf-8' : 'application/x-subrip; charset=utf-8'),
+    kind,
+    header: '',
+    entries: [],
+    cues: [],
+    seenKeys: new Set(),
+    windowHits: 0
+  };
+}
+
+function addTrackToChunkAccumulator(accumulator, track, windowIndex = 0) {
+  if (!accumulator || typeof track?.content !== 'string' || !track.content.trim()) {
+    return 0;
+  }
+
+  if ((!accumulator.label || accumulator.label === accumulator.id) && track?.label) {
+    accumulator.label = track.label;
+  }
+  if ((!accumulator.language || accumulator.language === 'und') && track?.language) {
+    accumulator.language = track.language;
+  }
+
+  let added = 0;
+  if (accumulator.kind === 'ass') {
+    const parsed = parseAssDialogueEntries(track.content);
+    if (parsed.header && !accumulator.header) {
+      accumulator.header = parsed.header;
+    }
+    for (const entry of parsed.entries) {
+      if (accumulator.seenKeys.has(entry.key)) {
+        continue;
+      }
+      accumulator.seenKeys.add(entry.key);
+      accumulator.entries.push({
+        ...entry,
+        windowIndex
+      });
+      added += 1;
+    }
+  } else {
+    const cues = parseSrtLikeCueBlocks(track.content);
+    for (const cue of cues) {
+      const key = `${buildSubtitleCueTimeKey(cue.startSec, cue.endSec)}|${normalizeSubtitleMergeText(cue.text)}`;
+      if (accumulator.seenKeys.has(key)) {
+        continue;
+      }
+      accumulator.seenKeys.add(key);
+      accumulator.cues.push({
+        ...cue,
+        key,
+        windowIndex
+      });
+      added += 1;
+    }
+  }
+
+  if (added > 0) {
+    accumulator.windowHits = Math.max(accumulator.windowHits, windowIndex + 1);
+  }
+  return added;
+}
+
+function finalizeChunkedTrackAccumulator(accumulator) {
+  if (!accumulator) return null;
+
+  if (accumulator.kind === 'ass') {
+    if (!accumulator.entries.length) return null;
+    const entries = accumulator.entries
+      .slice()
+      .sort((a, b) => (a.startSec - b.startSec) || (a.endSec - b.endSec) || (a.order - b.order));
+    const content = serializeMergedAssTrack(accumulator.header, entries);
+    if (!content.trim()) return null;
+    return {
+      id: accumulator.id || accumulator.key,
+      label: accumulator.label || accumulator.id || accumulator.key,
+      language: accumulator.language || 'und',
+      codec: accumulator.codec,
+      mime: accumulator.mime,
+      binary: false,
+      byteLength: content.length,
+      content
+    };
+  }
+
+  if (!accumulator.cues.length) return null;
+  const cues = accumulator.cues
+    .slice()
+    .sort((a, b) => (a.startSec - b.startSec) || (a.endSec - b.endSec) || (a.order - b.order));
+  const content = serializeSrtLikeCueBlocks(cues);
+  if (!content.trim()) return null;
+  return {
+    id: accumulator.id || accumulator.key,
+    label: accumulator.label || accumulator.id || accumulator.key,
+    language: accumulator.language || 'und',
+    codec: accumulator.codec,
+    mime: accumulator.mime,
+    binary: false,
+    byteLength: content.length,
+    content
+  };
+}
+
+function finalizeChunkedTrackAccumulators(accumulatorMap) {
+  return Array.from((accumulatorMap || new Map()).values())
+    .map((accumulator) => finalizeChunkedTrackAccumulator(accumulator))
+    .filter(Boolean)
+    .sort((a, b) => String(a?.id || a?.label || '').localeCompare(String(b?.id || b?.label || ''), undefined, { numeric: true }));
+}
+
 function isTrackQualityAcceptable(tracks, summary, timelines, durationSec) {
   if (!tracks?.length) return false;
   const minTrackSize = summary?.minTrackSize || 0;
@@ -6634,24 +7168,70 @@ function getRecoverySampleByteLength(sample) {
   return Number(sample.byteLength) || 0;
 }
 
+function getRecoverySampleCoverageRatio(sample) {
+  const sampleBytes = getRecoverySampleByteLength(sample);
+  const totalBytes = Number(sample?.totalBytes) || 0;
+  if (!sampleBytes || !totalBytes || totalBytes <= 0) return null;
+  return Math.max(0, Math.min(1, sampleBytes / totalBytes));
+}
+
+function shouldTrustRecoveryHeadSample(sample, durationSec, requireStrongSignals) {
+  if (Number.isFinite(durationSec) && durationSec > 0) {
+    return true;
+  }
+  if (!requireStrongSignals) {
+    return true;
+  }
+  const coverageRatio = getRecoverySampleCoverageRatio(sample);
+  if (coverageRatio !== null) {
+    return coverageRatio >= 0.75;
+  }
+  return sample?.partial !== true;
+}
+
 const COMPLETE_OPFS_DIRECT_DEMUX_MAX_BYTES = 1536 * 1024 * 1024;
 const COMPLETE_RECOVERY_HEAD_BYTES = 96 * 1024 * 1024;
 const COMPLETE_RECOVERY_HEAD_MAX_BYTES = 192 * 1024 * 1024;
+const EXTRACT_MODE_CHUNKED_PROGRESSIVE_OPFS_DEMUX = 'chunked-progressive-opfs-demux';
+const CHUNKED_OPFS_HEAD_DEMUX_BYTES = 96 * 1024 * 1024;
+const CHUNKED_OPFS_HEADER_PREFIX_BYTES = 48 * 1024 * 1024;
+const CHUNKED_OPFS_WINDOW_BYTES = 96 * 1024 * 1024;
+const CHUNKED_OPFS_WINDOW_OVERLAP_BYTES = 8 * 1024 * 1024;
+const CHUNKED_OPFS_MIN_WINDOW_BYTES = 24 * 1024 * 1024;
+const CHUNKED_OPFS_MAX_WINDOW_RETRIES = 2;
+const CHUNKED_OPFS_TIME_WINDOW_SECONDS = 150;
+const CHUNKED_OPFS_TIME_WINDOW_OVERLAP_SECONDS = 8;
+const CHUNKED_OPFS_MIN_TIME_WINDOW_SECONDS = 30;
+const CHUNKED_OPFS_MAX_TIME_WINDOW_RETRIES = 2;
+
+function formatFfmpegTimeArg(seconds) {
+  const totalMs = Math.max(0, Math.round((Number(seconds) || 0) * 1000));
+  const ms = totalMs % 1000;
+  const totalSeconds = (totalMs - ms) / 1000;
+  const s = totalSeconds % 60;
+  const totalMinutes = (totalSeconds - s) / 60;
+  const m = totalMinutes % 60;
+  const h = (totalMinutes - m) / 60;
+  const pad = (value, len = 2) => String(value).padStart(len, '0');
+  return `${pad(h)}:${pad(m)}:${pad(s)}.${pad(ms, 3)}`;
+}
 
 function shouldAvoidDirectOpfsFullDemux(byteLength) {
-  // Offscreen demux can now hand large OPFS files to a dedicated worker via WORKERFS,
-  // so we should attempt direct demux first and fall back only on real runtime failures.
-  return false;
+  return Number(byteLength) >= COMPLETE_OPFS_DIRECT_DEMUX_MAX_BYTES;
 }
 
 function isRecoverableOpfsDemuxFailure(err) {
   const msg = String(err?.message || err || '').toLowerCase();
+  const isTimeoutLike = msg.includes('ffmpeg demux timed out in offscreen page')
+    || msg.includes('offscreen demux timed out')
+    || (msg.includes('timed out') && (msg.includes('offscreen') || msg.includes('demux')));
   return msg.includes('failed to stream opfs temp file into ffmpeg fs')
     || msg.includes('too large for staged ffmpeg fs copy')
     || msg.includes('array buffer allocation failed')
     || msg.includes('could not enlarge memory')
     || msg.includes('out of memory')
-    || msg.includes('memory allocation');
+    || msg.includes('memory allocation')
+    || isTimeoutLike;
 }
 
 async function readOpfsTempFileSlice(tempName, maxBytes, offset = 0) {
@@ -6733,6 +7313,325 @@ async function readOpfsTempFileTail(tempName, maxBytes) {
 
 function getRecoverySliceSourceLabel(opfsTempName, fallbackLabel = 'remote stream') {
   return String(opfsTempName || '').trim() ? 'local disk copy' : fallbackLabel;
+}
+
+const BITMAP_SUBTITLE_OCR_NOT_IMPLEMENTED_MESSAGE = 'Image-based subtitle streams were detected, but OCR extraction is not implemented yet.';
+
+function collectSubtitleTrackDescriptors(tracks) {
+  return (tracks || []).filter((track) => {
+    const type = Number(track?.type);
+    const codecId = String(track?.codecId || track?.codec || '').toLowerCase();
+    return type === 0x11
+      || type === 17
+      || codecId.startsWith('s_');
+  });
+}
+
+function isTextSubtitleTrackDescriptor(track) {
+  const codecId = String(track?.codecId || track?.codec || '').toLowerCase();
+  const codecName = String(track?.codecName || '').toLowerCase();
+  return codecId.includes('s_text')
+    || codecId.includes('subrip')
+    || codecId.includes('webvtt')
+    || codecId.includes('ssa')
+    || codecId.includes('ass')
+    || codecName.includes('subrip')
+    || codecName.includes('webvtt')
+    || codecName.includes('ssa')
+    || codecName.includes('ass');
+}
+
+function summarizeMkvSubtitleTrackKinds(headerInfo) {
+  const subtitleTracks = collectSubtitleTrackDescriptors(headerInfo?.tracks || []);
+  const textTracks = subtitleTracks.filter(isTextSubtitleTrackDescriptor);
+  return {
+    subtitleTrackCount: subtitleTracks.length,
+    textTrackCount: textTracks.length,
+    bitmapTrackCount: Math.max(0, subtitleTracks.length - textTracks.length),
+    bitmapOnly: subtitleTracks.length > 0 && textTracks.length === 0
+  };
+}
+
+function throwBitmapSubtitleOcrNotImplemented(tabId, messageId, info = null, sourceLabel = 'this file') {
+  const subtitleInfo = info || {};
+  const count = Math.max(
+    0,
+    Number(subtitleInfo?.bitmapTrackCount)
+      || Number(subtitleInfo?.subtitleTrackCount)
+      || 0
+  );
+  const countLabel = count > 0
+    ? `${count} image-based subtitle stream(s)`
+    : 'image-based subtitle streams';
+  sendDebugLog(
+    tabId,
+    messageId,
+    `Detected ${countLabel} in ${sourceLabel} (likely PGS/VobSub). OCR extraction is not implemented yet, so the job stops here.`,
+    'error'
+  );
+  throw new Error(BITMAP_SUBTITLE_OCR_NOT_IMPLEMENTED_MESSAGE);
+}
+
+function collectTextSubtitleTrackNumbers(tracks) {
+  return new Set(
+    (tracks || [])
+      .filter(isTextSubtitleTrackDescriptor)
+      .map((track) => Number(track?.number))
+      .filter((number) => Number.isFinite(number) && number > 0)
+  );
+}
+
+async function resolveMkvCueList(ctx, headerInfo) {
+  const cuesAlready = Array.isArray(headerInfo?.cues) && headerInfo.cues.length
+    ? headerInfo.cues
+    : null;
+  if (cuesAlready) {
+    return cuesAlready;
+  }
+
+  const cueSeek = Array.isArray(headerInfo?.seekHead)
+    ? headerInfo.seekHead.find((entry) => entry.idHex === '1C53BB6B')
+    : null;
+  if (!cueSeek || headerInfo?.segmentOffset === null || headerInfo?.segmentOffset === undefined) {
+    return null;
+  }
+
+  const cueStart = Number(headerInfo.segmentOffset) + Number(cueSeek.position || 0);
+  const cueWindow = 8 * 1024 * 1024;
+  const cueBuf = await fetchRangeSlice(
+    ctx.streamUrl,
+    cueStart,
+    cueStart + cueWindow - 1,
+    (progress) => {
+      const base = Number(ctx?.progressBase) || 0;
+      const span = Number(ctx?.progressSpan) || 0;
+      const pct = Math.min(99, Math.round(base + (progress * span)));
+      if (ctx?.tabId && ctx?.messageId) {
+        sendExtractProgress(ctx.tabId, ctx.messageId, pct, `Reading MKV Cues from ${ctx.sliceSourceLabel || ctx.hostLabel || 'stream'}...`);
+      }
+    },
+    ctx.baseHeaders,
+    {
+      signal: ctx.signal,
+      ...(ctx.localOpfsTempName ? { localOpfsTempName: ctx.localOpfsTempName, localTotalBytes: ctx.localTotalBytes } : {})
+    }
+  );
+  const parsed = parseMkvCuesFromBuffer(cueBuf.buffer || cueBuf, { maxScanBytes: cueWindow });
+  return parsed.length ? parsed : null;
+}
+
+function packChunkedDemuxWindows(ranges, options = {}) {
+  const maxWindowBytes = Math.max(CHUNKED_OPFS_MIN_WINDOW_BYTES, Number(options.maxWindowBytes) || CHUNKED_OPFS_WINDOW_BYTES);
+  const overlapBytes = Math.max(0, Number(options.overlapBytes) || CHUNKED_OPFS_WINDOW_OVERLAP_BYTES);
+  const maxGapBytes = Math.max(0, Number(options.maxGapBytes) || (2 * 1024 * 1024));
+  const totalBytes = Number(options.totalBytes) || null;
+  const source = options.source || 'range';
+
+  const sorted = (ranges || [])
+    .map((range) => {
+      const start = Math.max(0, Number(range?.start) || 0);
+      const rawEnd = Math.max(start, Number(range?.end) || start);
+      const end = totalBytes ? Math.min(totalBytes - 1, rawEnd) : rawEnd;
+      return { start, end };
+    })
+    .filter((range) => range.end >= range.start)
+    .sort((a, b) => a.start - b.start);
+
+  if (!sorted.length) {
+    return [];
+  }
+
+  const packed = [];
+  let current = null;
+  for (const range of sorted) {
+    if (!current) {
+      current = { ...range };
+      continue;
+    }
+    const proposedEnd = Math.max(current.end, range.end);
+    const proposedBytes = proposedEnd - current.start + 1;
+    const gapBytes = Math.max(0, range.start - current.end - 1);
+    if (gapBytes <= maxGapBytes && proposedBytes <= maxWindowBytes) {
+      current.end = proposedEnd;
+      continue;
+    }
+    packed.push(current);
+    current = { ...range };
+  }
+  if (current) {
+    packed.push(current);
+  }
+
+  const normalized = [];
+  for (const range of packed) {
+    const rangeBytes = range.end - range.start + 1;
+    if (rangeBytes <= maxWindowBytes) {
+      normalized.push({ ...range, source, retryCount: 0 });
+      continue;
+    }
+
+    const stride = Math.max(CHUNKED_OPFS_MIN_WINDOW_BYTES, maxWindowBytes - overlapBytes);
+    let offset = range.start;
+    while (offset <= range.end) {
+      const end = totalBytes
+        ? Math.min(totalBytes - 1, offset + maxWindowBytes - 1)
+        : Math.min(range.end, offset + maxWindowBytes - 1);
+      normalized.push({ start: offset, end, source, retryCount: 0 });
+      if (end >= range.end) {
+        break;
+      }
+      offset = Math.max(offset + 1, end - overlapBytes + 1);
+      offset = Math.max(offset, range.start + stride);
+    }
+  }
+
+  return normalized;
+}
+
+function buildCueAlignedChunkedDemuxWindows(headerInfo, cueList, totalBytes, options = {}) {
+  const trackNumbers = collectTextSubtitleTrackNumbers(headerInfo?.tracks);
+  if (!trackNumbers.size || !Array.isArray(cueList) || !cueList.length) {
+    return [];
+  }
+
+  const segmentOffset = Number(headerInfo?.segmentOffset) || 0;
+  const preBytes = Math.max(64 * 1024, Number(options.preBytes) || (256 * 1024));
+  const postBytes = Math.max(512 * 1024, Number(options.postBytes) || (4 * 1024 * 1024));
+  const startOffset = Math.max(0, Number(options.startOffset) || 0);
+  const ranges = [];
+
+  for (const cue of cueList) {
+    for (const position of cue?.positions || []) {
+      if (!trackNumbers.has(Number(position?.track))) {
+        continue;
+      }
+      if (!Number.isFinite(position?.clusterPos)) {
+        continue;
+      }
+      const clusterOffset = segmentOffset + Number(position.clusterPos) + (Number(position?.relPos) || 0);
+      const start = Math.max(0, clusterOffset - preBytes);
+      const end = totalBytes
+        ? Math.min(totalBytes - 1, clusterOffset + postBytes)
+        : clusterOffset + postBytes;
+      if (end < startOffset) {
+        continue;
+      }
+      ranges.push({
+        start: Math.max(startOffset, start),
+        end
+      });
+    }
+  }
+
+  return packChunkedDemuxWindows(ranges, {
+    totalBytes,
+    maxWindowBytes: options.maxWindowBytes,
+    overlapBytes: options.overlapBytes,
+    maxGapBytes: options.maxGapBytes,
+    source: 'cue'
+  });
+}
+
+function buildFixedChunkedDemuxWindows(startOffset, totalBytes, options = {}) {
+  const start = Math.max(0, Number(startOffset) || 0);
+  const total = Math.max(start, Number(totalBytes) || 0);
+  if (!total || start >= total) {
+    return [];
+  }
+
+  const windowBytes = Math.max(CHUNKED_OPFS_MIN_WINDOW_BYTES, Number(options.windowBytes) || CHUNKED_OPFS_WINDOW_BYTES);
+  const overlapBytes = Math.max(0, Number(options.overlapBytes) || CHUNKED_OPFS_WINDOW_OVERLAP_BYTES);
+  const stride = Math.max(1, windowBytes - overlapBytes);
+  const windows = [];
+
+  let offset = start;
+  while (offset < total) {
+    const end = Math.min(total - 1, offset + windowBytes - 1);
+    windows.push({
+      start: offset,
+      end,
+      source: 'fixed',
+      retryCount: 0
+    });
+    if (end >= total - 1) {
+      break;
+    }
+    offset += stride;
+  }
+
+  return windows;
+}
+
+function buildChunkedOpfsTimeWindows(durationSec, options = {}) {
+  const duration = Math.max(0, Number(durationSec) || 0);
+  if (!duration) {
+    return [];
+  }
+
+  const windowSeconds = Math.max(
+    CHUNKED_OPFS_MIN_TIME_WINDOW_SECONDS,
+    Number(options.windowSeconds) || CHUNKED_OPFS_TIME_WINDOW_SECONDS
+  );
+  const overlapSeconds = Math.max(
+    0,
+    Math.min(windowSeconds / 3, Number(options.overlapSeconds) || CHUNKED_OPFS_TIME_WINDOW_OVERLAP_SECONDS)
+  );
+  const stride = Math.max(1, windowSeconds - overlapSeconds);
+  const windows = [];
+
+  let startSec = 0;
+  while (startSec < duration) {
+    const remaining = Math.max(0, duration - startSec);
+    const durSec = Math.min(windowSeconds, remaining);
+    windows.push({
+      startSec,
+      durSec,
+      retryCount: 0,
+      source: 'time'
+    });
+    if (startSec + durSec >= duration) {
+      break;
+    }
+    startSec += stride;
+  }
+
+  return windows;
+}
+
+function splitChunkedTimeWindow(window, options = {}) {
+  const retryCount = Number(window?.retryCount) || 0;
+  const maxRetries = Number(options.maxRetries) || CHUNKED_OPFS_MAX_TIME_WINDOW_RETRIES;
+  const minWindowSeconds = Math.max(1, Number(options.minWindowSeconds) || CHUNKED_OPFS_MIN_TIME_WINDOW_SECONDS);
+  const overlapSeconds = Math.max(0, Number(options.overlapSeconds) || CHUNKED_OPFS_TIME_WINDOW_OVERLAP_SECONDS);
+  const startSec = Math.max(0, Number(window?.startSec) || 0);
+  const durSec = Math.max(0, Number(window?.durSec) || 0);
+
+  if (durSec <= minWindowSeconds || retryCount >= maxRetries) {
+    return [];
+  }
+
+  const half = durSec / 2;
+  const leftDurSec = Math.max(minWindowSeconds, Math.min(durSec, half + (overlapSeconds / 2)));
+  const rightStartSec = Math.max(startSec + Math.max(1, half - (overlapSeconds / 2)), startSec + 1);
+  const rightDurSec = Math.max(minWindowSeconds, (startSec + durSec) - rightStartSec);
+  if (rightStartSec >= startSec + durSec || rightDurSec <= 0) {
+    return [];
+  }
+
+  return [
+    {
+      startSec,
+      durSec: leftDurSec,
+      retryCount: retryCount + 1,
+      source: window?.source || 'time'
+    },
+    {
+      startSec: rightStartSec,
+      durSec: rightDurSec,
+      retryCount: retryCount + 1,
+      source: window?.source || 'time'
+    }
+  ];
 }
 
 async function materializeOpfsRecoveryHeadSample(sample, minBytes = COMPLETE_RECOVERY_HEAD_BYTES, maxBytes = COMPLETE_RECOVERY_HEAD_MAX_BYTES) {
@@ -6915,12 +7814,19 @@ function readVint(u8, offset) {
     length += 1;
     mask >>= 1;
   }
-  if (length > 8) return null;
-  let value = first & (mask - 1);
+  if (length > 8 || offset + length > u8.length) return null;
+  let value = BigInt(first & (mask - 1));
   for (let i = 1; i < length; i++) {
-    value = (value << 8) | u8[offset + i];
+    value = (value * 256n) + BigInt(u8[offset + i]);
   }
-  return { length, value };
+  const unknownValue = (1n << BigInt(7 * length)) - 1n;
+  return {
+    length,
+    value: value > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(value),
+    valueBigInt: value,
+    isUnknownSize: value === unknownValue,
+    exceedsSafeInteger: value > BigInt(Number.MAX_SAFE_INTEGER)
+  };
 }
 
 function readEbmlElement(u8, offset, limit) {
@@ -6937,7 +7843,7 @@ function readEbmlElement(u8, offset, limit) {
   const dataStart = offset + idInfo.length + sizeInfo.length;
   let size = sizeInfo.value;
   // Unknown-size EBML elements set all size bits; treat as consuming the remaining scan window
-  if (size === (Math.pow(2, 7 * sizeInfo.length) - 1)) {
+  if (sizeInfo.isUnknownSize || sizeInfo.exceedsSafeInteger) {
     size = Math.max(0, limit - dataStart);
   }
   let dataEnd = dataStart + size;
@@ -7004,9 +7910,9 @@ function parseMkvHeaderInfo(buffer, opts = {}) {
   };
 
   function parseUint(u8, start, end) {
-    let v = 0;
-    for (let i = start; i < end; i++) v = (v << 8) | u8[i];
-    return v >>> 0;
+    let v = 0n;
+    for (let i = start; i < end; i++) v = (v * 256n) + BigInt(u8[i]);
+    return v > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(v);
   }
 
   function parseString(u8, start, end) {
@@ -7150,6 +8056,84 @@ function parseMkvHeaderInfo(buffer, opts = {}) {
   return { ...info, segmentOffset: segmentStart ?? info.segmentOffset };
 }
 
+function parseMkvCuesFromBuffer(buffer, opts = {}) {
+  const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer || 0);
+  const limit = Math.min(u8.length, opts.maxScanBytes || u8.length);
+  if (!limit) return [];
+
+  const ID = {
+    CUES: '1C53BB6B',
+    CUE_POINT: 'BB',
+    CUE_TIME: 'B3',
+    CUE_TRACK_POSITIONS: 'B7',
+    CUE_TRACK: 'F7',
+    CUE_CLUSTER_POS: 'F1',
+    CUE_REL_POS: 'F0'
+  };
+
+  function parseUint(start, end) {
+    let v = 0n;
+    for (let i = start; i < end; i++) v = (v * 256n) + BigInt(u8[i]);
+    return v > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(v);
+  }
+
+  function walk(start, end, handlers) {
+    let p = start;
+    while (p < end) {
+      const el = readEbmlElement(u8, p, end);
+      if (!el) break;
+      const handler = handlers?.[el.idHex];
+      if (handler) {
+        handler(el);
+      }
+      p = el.dataEnd;
+    }
+  }
+
+  function parseCuesElement(cuesEl) {
+    const cues = [];
+    walk(cuesEl.dataStart, Math.min(cuesEl.dataEnd, limit), {
+      [ID.CUE_POINT]: (cpEl) => {
+        let cueTime = null;
+        const positions = [];
+        walk(cpEl.dataStart, Math.min(cpEl.dataEnd, limit), {
+          [ID.CUE_TIME]: (tEl) => { cueTime = parseUint(tEl.dataStart, tEl.dataEnd); },
+          [ID.CUE_TRACK_POSITIONS]: (posEl) => {
+            let track = null;
+            let clusterPos = null;
+            let relPos = null;
+            walk(posEl.dataStart, Math.min(posEl.dataEnd, limit), {
+              [ID.CUE_TRACK]: (elT) => { track = parseUint(elT.dataStart, elT.dataEnd); },
+              [ID.CUE_CLUSTER_POS]: (elP) => { clusterPos = parseUint(elP.dataStart, elP.dataEnd); },
+              [ID.CUE_REL_POS]: (elRP) => { relPos = parseUint(elRP.dataStart, elRP.dataEnd); }
+            });
+            positions.push({ track, clusterPos, relPos });
+          }
+        });
+        if (cueTime !== null) {
+          cues.push({ time: cueTime, positions });
+        }
+      }
+    });
+    return cues;
+  }
+
+  const firstEl = readEbmlElement(u8, 0, limit);
+  if (firstEl?.idHex === ID.CUES) {
+    return parseCuesElement(firstEl);
+  }
+
+  let parsedCues = [];
+  walk(0, limit, {
+    [ID.CUES]: (cuesEl) => {
+      if (!parsedCues.length) {
+        parsedCues = parseCuesElement(cuesEl);
+      }
+    }
+  });
+  return parsedCues;
+}
+
 async function tryCueGuidedMkvExtraction(ctx) {
   const {
     streamUrl,
@@ -7170,7 +8154,9 @@ async function tryCueGuidedMkvExtraction(ctx) {
   const subtitleTracks = headerInfo.tracks.filter(t => t.type === 0x11 || t.type === 17 || t.codecId?.toLowerCase().includes('s_text'));
   let attachmentTracks = [];
   if (headerInfo.attachments.length) {
-    attachmentTracks = headerInfo.attachments.map((att, idx) => {
+    attachmentTracks = headerInfo.attachments
+      .filter(isSubtitleAttachmentFile)
+      .map((att, idx) => {
       const lowerName = (att.name || '').toLowerCase();
       const lowerMime = (att.mime || '').toLowerCase();
       const isText = lowerMime.startsWith('text/') || lowerMime.includes('subtitle') || lowerName.endsWith('.srt') || lowerName.endsWith('.ass') || lowerName.endsWith('.ssa') || lowerName.endsWith('.vtt');
@@ -7215,8 +8201,8 @@ async function tryCueGuidedMkvExtraction(ctx) {
           ...(localOpfsTempName ? { localOpfsTempName, localTotalBytes } : {})
         }
       );
-      const parsed = parseMkvHeaderInfo(cueBuf.buffer || cueBuf, { maxScanBytes: cueWindow });
-      cueList = parsed.cues?.length ? parsed.cues : null;
+      const parsedCues = parseMkvCuesFromBuffer(cueBuf.buffer || cueBuf, { maxScanBytes: cueWindow });
+      cueList = parsedCues.length ? parsedCues : null;
     } catch (err) {
       if (isAbortError(err)) throw err;
       console.warn('[Background] Cue fetch via SeekHead failed:', err?.message || err);
@@ -7308,11 +8294,18 @@ function readEbmlVint(bytes, offset, stripLengthMarker = false) {
     length += 1;
   }
   if (length > 8 || offset + length > bytes.length) return null;
-  let value = stripLengthMarker ? (first & (lengthMask - 1)) : first;
+  let value = BigInt(stripLengthMarker ? (first & (lengthMask - 1)) : first);
   for (let i = 1; i < length; i++) {
-    value = (value << 8) + bytes[offset + i];
+    value = (value * 256n) + BigInt(bytes[offset + i]);
   }
-  return { length, value };
+  const unknownValue = stripLengthMarker ? ((1n << BigInt(7 * length)) - 1n) : null;
+  return {
+    length,
+    value: value > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(value),
+    valueBigInt: value,
+    isUnknownSize: stripLengthMarker ? value === unknownValue : false,
+    exceedsSafeInteger: value > BigInt(Number.MAX_SAFE_INTEGER)
+  };
 }
 
 function probeMkvDuration(buffer) {
@@ -7811,10 +8804,10 @@ async function tryCompleteModeRangeRecovery(ctx) {
     initialSample = null
   } = ctx;
   const signal = ctx?.signal || getExtractJobSignal(messageId);
-  const localOpfsTempName = isOpfsTempDemuxSource(initialSample)
+  let localOpfsTempName = isOpfsTempDemuxSource(initialSample)
     ? String(initialSample.opfsTempName || '').trim()
     : '';
-  const localTotalBytes = isOpfsTempDemuxSource(initialSample)
+  let localTotalBytes = isOpfsTempDemuxSource(initialSample)
     ? (Number(initialSample?.totalBytes) || Number(initialSample?.byteLength) || null)
     : null;
 
@@ -7834,6 +8827,8 @@ async function tryCompleteModeRangeRecovery(ctx) {
         sample = materialized;
       }
     } catch (opfsReadErr) {
+      localOpfsTempName = '';
+      localTotalBytes = null;
       sendDebugLog(tabId, messageId, `Range recovery could not reuse the OPFS temp file locally (${opfsReadErr?.message || opfsReadErr}); fetching a fresh head sample instead...`, 'warn');
     }
   }
@@ -7874,22 +8869,39 @@ async function tryCompleteModeRangeRecovery(ctx) {
   let summary = { minTrackSize: 0, lastCueSec: null };
   const durationSec = sample?.durationSec || (buffer ? probeContainerDuration(buffer) : null) || null;
   const requireStrongSignals = sample?.partial === true || !!sample?.totalBytes;
+  const headCoverageRatio = getRecoverySampleCoverageRatio(sample);
+  const trustHeadSample = shouldTrustRecoveryHeadSample(sample, durationSec, requireStrongSignals);
 
   try {
     headTracks = await demuxSubtitlesOffscreen(demuxSource, messageId, tabId);
     summary = summarizeTracks(headTracks);
     if (headTracks.length) {
       const timelines = analyzeCueTimelines(headTracks);
-      if (isRecoveryTrackSetAcceptable(headTracks, summary, timelines, durationSec, { requireStrongSignals })) {
+      const headLooksComplete = isRecoveryTrackSetAcceptable(headTracks, summary, timelines, durationSec, { requireStrongSignals });
+      if (headLooksComplete && trustHeadSample) {
         sendDebugLog(tabId, messageId, 'Range recovery: head sample already looks complete; using it instead of full download.', 'info');
         return { tracks: headTracks, mode: 'head-sample' };
       }
-      sendDebugLog(
-        tabId,
-        messageId,
-        `Range recovery: head sample incomplete (min=${Math.round((summary.minTrackSize || 0) / 1024)}KB, last=${summary.lastCueSec ? Math.round(summary.lastCueSec) + 's' : 'n/a'}); trying targeted MKV recovery...`,
-        'warn'
-      );
+      if (headLooksComplete && !trustHeadSample) {
+        const coverageText = headCoverageRatio !== null
+          ? `the current head sample only covers ~${Math.round(headCoverageRatio * 100)}% of the file`
+          : (sample?.partial === true
+            ? 'the current head sample is still partial and the runtime is unknown'
+            : 'the runtime is unknown and the sampled file coverage is unclear');
+        sendDebugLog(
+          tabId,
+          messageId,
+          `Range recovery: head sample looks plausible but cannot be trusted as complete because ${coverageText}; trying targeted MKV recovery...`,
+          'warn'
+        );
+      } else {
+        sendDebugLog(
+          tabId,
+          messageId,
+          `Range recovery: head sample incomplete (min=${Math.round((summary.minTrackSize || 0) / 1024)}KB, last=${summary.lastCueSec ? Math.round(summary.lastCueSec) + 's' : 'n/a'}); trying targeted MKV recovery...`,
+          'warn'
+        );
+      }
     }
   } catch (headErr) {
     if (isAbortError(headErr)) throw headErr;
@@ -7934,7 +8946,14 @@ async function tryCompleteModeRangeRecovery(ctx) {
     const targetedSummary = summarizeTracks(targeted);
     const targetedTimelines = analyzeCueTimelines(targeted);
     if (isRecoveryTrackSetAcceptable(targeted, targetedSummary, targetedTimelines, targetedDurationSec, { requireStrongSignals })) {
-      sendDebugLog(tabId, messageId, 'Range recovery: targeted MKV strategy succeeded.', 'info');
+      sendDebugLog(
+        tabId,
+        messageId,
+        targetedDurationSec
+          ? 'Range recovery: targeted MKV strategy succeeded.'
+          : 'Range recovery: targeted MKV strategy improved coverage and is being used because the head sample could not be trusted as complete.',
+        'info'
+      );
       return { tracks: targeted, mode: 'targeted-mkv' };
     }
     sendDebugLog(
@@ -7948,9 +8967,314 @@ async function tryCompleteModeRangeRecovery(ctx) {
   return null;
 }
 
+async function extractChunkedProgressiveOpfsDemuxFromLocalOpfs({
+  streamUrl,
+  tabId,
+  messageId,
+  hints = {},
+  baseHeaders = null,
+  hostLabel = null,
+  preflightSample = null,
+  full
+}) {
+  const signal = hints?.signal || getExtractJobSignal(messageId);
+  const effectiveHostLabel = hostLabel || (() => { try { return new URL(streamUrl).hostname; } catch (_) { return streamUrl; } })();
+  if (!full?.opfsTempName || !full?.byteLength) {
+    throw new Error('ChunkedOpfs requires a local OPFS temp file but no reusable full download was provided.');
+  }
+
+  const headSample = await materializeOpfsRecoveryHeadSample(full, CHUNKED_OPFS_HEAD_DEMUX_BYTES, CHUNKED_OPFS_HEAD_DEMUX_BYTES);
+  const headBuffer = headSample?.buffer || null;
+  if (!headBuffer?.byteLength) {
+    throw new Error('ChunkedOpfs could not materialize a head sample from the local OPFS download.');
+  }
+
+  const durationSec = preflightSample?.durationSec
+    || probeContainerDuration(headBuffer)
+    || estimateDurationFromBytes(full.totalBytes || full.byteLength || 0)
+    || null;
+  const headerInfo = parseMkvHeaderInfo(headBuffer, { maxScanBytes: Math.min(headBuffer.byteLength, 24 * 1024 * 1024) || 24 * 1024 * 1024 });
+  const subtitleKindSummary = summarizeMkvSubtitleTrackKinds(headerInfo);
+  const expectedTextTrackCount = subtitleKindSummary.textTrackCount;
+  if (subtitleKindSummary.bitmapOnly) {
+    throwBitmapSubtitleOcrNotImplemented(tabId, messageId, subtitleKindSummary, 'the MKV subtitle plan');
+  }
+  const sliceSourceLabel = getRecoverySliceSourceLabel(full.opfsTempName, effectiveHostLabel);
+  const cueList = await resolveMkvCueList({
+    streamUrl,
+    baseHeaders,
+    messageId,
+    tabId,
+    hostLabel: effectiveHostLabel,
+    sliceSourceLabel,
+    signal,
+    localOpfsTempName: full.opfsTempName,
+    localTotalBytes: full.totalBytes || full.byteLength || null,
+    progressBase: 58,
+    progressSpan: 0.06
+  }, headerInfo).catch((cueErr) => {
+    if (isAbortError(cueErr)) throw cueErr;
+    sendDebugLog(tabId, messageId, `ChunkedOpfs: cue fetch failed (${cueErr?.message || cueErr}); falling back to time-window extraction.`, 'warn');
+    return null;
+  });
+  const timeWindows = buildChunkedOpfsTimeWindows(durationSec, {
+    windowSeconds: CHUNKED_OPFS_TIME_WINDOW_SECONDS,
+    overlapSeconds: CHUNKED_OPFS_TIME_WINDOW_OVERLAP_SECONDS
+  });
+
+  sendDebugLog(
+    tabId,
+    messageId,
+    `ChunkedOpfs: header textTracks=${expectedTextTrackCount} cueCount=${cueList?.length || 0} plannedTimeWindows=${timeWindows.length} duration=${durationSec ? Math.round(durationSec) + 's' : 'n/a'}`,
+    'info'
+  );
+
+  const accumulators = new Map();
+  const mergeTracksIntoAccumulators = (tracks, windowIndex) => {
+    let addedEntries = 0;
+    for (const track of tracks || []) {
+      const key = buildChunkedTrackMergeKey(track);
+      if (!accumulators.has(key)) {
+        accumulators.set(key, createChunkedTrackAccumulator(track));
+      }
+      addedEntries += addTrackToChunkAccumulator(accumulators.get(key), track, windowIndex);
+    }
+    return addedEntries;
+  };
+  const buildMergedTracks = () => applyContentLanguageGuesses(finalizeChunkedTrackAccumulators(accumulators));
+
+  sendExtractProgress(tabId, messageId, 60, 'ChunkedOpfs: demuxing local head sample...');
+  try {
+    const headTracks = await demuxSubtitlesOffscreen(headBuffer, messageId, tabId, {
+      signal,
+      keepaliveProgress: 60,
+      keepaliveStatus: 'ChunkedOpfs: demuxing local head sample...'
+    });
+    const headAdded = mergeTracksIntoAccumulators(headTracks, 0);
+    sendDebugLog(tabId, messageId, `ChunkedOpfs: head sample yielded ${headTracks.length} track(s), added ${headAdded} unique cues/events.`, 'info');
+  } catch (headErr) {
+    if (isAbortError(headErr)) throw headErr;
+    sendDebugLog(tabId, messageId, `ChunkedOpfs: head demux failed (${headErr?.message || headErr}); continuing with local time windows.`, 'warn');
+  }
+
+  const pendingWindows = timeWindows.slice();
+  let completedWindows = 0;
+  let failedWindows = 0;
+  const initialPlannedWindows = Math.max(1, pendingWindows.length);
+
+  while (pendingWindows.length) {
+    throwIfAborted(signal, 'Extraction cancelled');
+    const window = pendingWindows.shift();
+    const progressDenominator = Math.max(initialPlannedWindows, completedWindows + pendingWindows.length + 1);
+    const progressPct = Math.min(96, 62 + Math.round((completedWindows / progressDenominator) * 30));
+    const windowEndSec = (Number(window?.startSec) || 0) + (Number(window?.durSec) || 0);
+    const windowLabel = `ChunkedOpfs: demuxing time window ${completedWindows + 1}/${progressDenominator} (${formatSecondsShort(window?.startSec || 0)}-${formatSecondsShort(windowEndSec)})...`;
+
+    sendExtractProgress(tabId, messageId, progressPct, windowLabel);
+    try {
+      const windowTracks = await demuxSubtitlesOffscreen({
+        opfsTempName: full.opfsTempName,
+        byteLength: full.totalBytes || full.byteLength || 0
+      }, messageId, tabId, {
+        signal,
+        keepaliveProgress: progressPct,
+        keepaliveStatus: windowLabel,
+        skipFlatCueRepair: true,
+        inputArgs: [
+          '-copyts',
+          '-ss', formatFfmpegTimeArg(window?.startSec || 0),
+          '-t', formatFfmpegTimeArg(window?.durSec || 0),
+          '-analyzeduration', '60M',
+          '-probesize', '60M'
+        ],
+        skipCopyTracks: true
+      });
+      const addedEntries = mergeTracksIntoAccumulators(windowTracks, completedWindows + 1);
+      completedWindows += 1;
+
+      const mergedTracks = buildMergedTracks();
+      const mergedSummary = summarizeTracks(mergedTracks);
+      sendDebugLog(
+        tabId,
+        messageId,
+        `ChunkedOpfs: time window ${completedWindows} ${formatSecondsShort(window?.startSec || 0)}-${formatSecondsShort(windowEndSec)} -> tracks=${windowTracks.length} added=${addedEntries} mergedTracks=${mergedTracks.length} lastCue=${mergedSummary.lastCueSec ? Math.round(mergedSummary.lastCueSec) + 's' : 'n/a'} retry=${window.retryCount || 0}`,
+        'info'
+      );
+
+      if (expectedTextTrackCount > 0 && mergedTracks.length >= expectedTextTrackCount) {
+        const timelines = analyzeCueTimelines(mergedTracks);
+        if (isRecoveryTrackSetAcceptable(mergedTracks, mergedSummary, timelines, durationSec, { requireStrongSignals: true })) {
+          sendExtractProgress(tabId, messageId, 100, `ChunkedOpfs: merged ${mergedTracks.length} track(s) from local OPFS time windows`);
+          return mergedTracks;
+        }
+      }
+    } catch (windowErr) {
+      if (isAbortError(windowErr)) throw windowErr;
+
+      const splitWindows = splitChunkedTimeWindow(window, {
+        overlapSeconds: CHUNKED_OPFS_TIME_WINDOW_OVERLAP_SECONDS,
+        minWindowSeconds: CHUNKED_OPFS_MIN_TIME_WINDOW_SECONDS,
+        maxRetries: CHUNKED_OPFS_MAX_TIME_WINDOW_RETRIES
+      });
+      if (splitWindows.length) {
+        pendingWindows.unshift(...splitWindows.reverse());
+        sendDebugLog(
+          tabId,
+          messageId,
+          `ChunkedOpfs: time window ${formatSecondsShort(window?.startSec || 0)}-${formatSecondsShort(windowEndSec)} failed (${windowErr?.message || windowErr}); splitting into ${splitWindows.length} smaller window(s).`,
+          'warn'
+        );
+        continue;
+      }
+
+      failedWindows += 1;
+      sendDebugLog(
+        tabId,
+        messageId,
+        `ChunkedOpfs: time window ${formatSecondsShort(window?.startSec || 0)}-${formatSecondsShort(windowEndSec)} failed permanently (${windowErr?.message || windowErr}).`,
+        'warn'
+      );
+    }
+  }
+
+  const mergedTracks = buildMergedTracks();
+  if (mergedTracks.length) {
+    const mergedSummary = summarizeTracks(mergedTracks);
+    const mergedTimelines = analyzeCueTimelines(mergedTracks);
+    sendDebugLog(
+      tabId,
+      messageId,
+      `ChunkedOpfs: time-window pass finished (completed=${completedWindows}, failed=${failedWindows}, mergedTracks=${mergedTracks.length}, lastCue=${mergedSummary.lastCueSec ? Math.round(mergedSummary.lastCueSec) + 's' : 'n/a'}).`,
+      failedWindows ? 'warn' : 'info'
+    );
+    if (isRecoveryTrackSetAcceptable(mergedTracks, mergedSummary, mergedTimelines, durationSec, { requireStrongSignals: true })) {
+      sendExtractProgress(tabId, messageId, 100, `ChunkedOpfs: merged ${mergedTracks.length} track(s) from local OPFS time windows`);
+      return mergedTracks;
+    }
+  } else {
+    sendDebugLog(tabId, messageId, 'ChunkedOpfs: time-window pass produced no usable text tracks.', 'warn');
+  }
+
+  sendDebugLog(tabId, messageId, 'ChunkedOpfs: falling back to targeted MKV recovery on the local OPFS copy.', 'warn');
+  const recovered = await tryCompleteModeRangeRecovery({
+    streamUrl,
+    messageId,
+    tabId,
+    hostLabel: effectiveHostLabel,
+    baseHeaders,
+    initialSample: full,
+    signal
+  });
+  if (recovered?.tracks?.length) {
+    const tracks = applyContentLanguageGuesses(recovered.tracks);
+    const summary = summarizeTracks(tracks);
+    const lastCueText = summary?.lastCueSec ? `; last cue at ${Math.round(summary.lastCueSec)}s` : '';
+    sendExtractProgress(tabId, messageId, 100, `ChunkedOpfs: recovered ${tracks.length} track(s) after bounded-window fallback${lastCueText}`);
+    return tracks;
+  }
+
+  if (mergedTracks.length) {
+    const mergedSummary = summarizeTracks(mergedTracks);
+    if (mergedTracks.length >= Math.max(1, expectedTextTrackCount) && (mergedSummary.maxTrackSize || 0) >= 48 * 1024) {
+      sendDebugLog(tabId, messageId, 'ChunkedOpfs: targeted fallback failed; returning best-effort merged text tracks.', 'warn');
+      sendExtractProgress(tabId, messageId, 100, `ChunkedOpfs: returning ${mergedTracks.length} best-effort merged track(s)`);
+      return mergedTracks;
+    }
+  }
+
+  throw new Error('ChunkedOpfs could not assemble complete subtitle tracks from bounded windows or targeted local recovery.');
+}
+
+async function extractChunkedProgressiveOpfsDemux(streamUrl, tabId, messageId, hints = {}) {
+  const signal = hints?.signal || getExtractJobSignal(messageId);
+  const baseHeaders = mergeHeaders(null, hints?.pageHeaders || null);
+  const hostLabel = (() => { try { return new URL(streamUrl).hostname; } catch (_) { return streamUrl; } })();
+  const lowerUrl = String(streamUrl || '').toLowerCase();
+  const isHls = hints.isHls === true || /\.m3u8(\?|$)/i.test(lowerUrl);
+  const isDash = hints.isDash === true || /\.mpd(\?|$)/i.test(lowerUrl);
+
+  if (isHls || isDash) {
+    sendDebugLog(tabId, messageId, 'ChunkedOpfs: manifest stream detected; routing to Complete mode.', 'warn');
+    return extractEmbeddedSubtitles(streamUrl, 'complete', tabId, messageId, hints);
+  }
+
+  sendExtractProgress(tabId, messageId, 4, `ChunkedOpfs: probing ${hostLabel} before full download...`);
+  let preflightSample = null;
+  try {
+    preflightSample = await fetchByteRangeSample(
+      streamUrl,
+      (progress) => sendExtractProgress(tabId, messageId, Math.min(18, 4 + Math.round(progress * 0.14)), `ChunkedOpfs: probing ${hostLabel}...`),
+      { minBytes: 24 * 1024 * 1024, maxBytesCap: 48 * 1024 * 1024 },
+      baseHeaders,
+      { signal }
+    );
+  } catch (probeErr) {
+    if (isAbortError(probeErr)) throw probeErr;
+    sendDebugLog(tabId, messageId, `ChunkedOpfs: preflight probe failed (${probeErr?.message || probeErr}); continuing with full download.`, 'warn');
+  }
+
+  const probeBuffer = preflightSample?.buffer || null;
+  if (probeBuffer?.byteLength && !isLikelyMkv(streamUrl, preflightSample?.contentType || '', probeBuffer)) {
+    sendDebugLog(tabId, messageId, 'ChunkedOpfs: stream does not look like a regular MKV; routing to Complete mode.', 'warn');
+    return extractEmbeddedSubtitles(streamUrl, 'complete', tabId, messageId, hints);
+  }
+
+  let full = null;
+  try {
+    sendExtractProgress(tabId, messageId, 8, `ChunkedOpfs: downloading full stream from ${hostLabel} to local OPFS...`);
+    full = await fetchFullStream(
+      streamUrl,
+      (progress) => sendExtractProgress(tabId, messageId, Math.min(58, 8 + Math.round(progress * 0.5)), `ChunkedOpfs: downloading full stream from ${hostLabel}...`),
+      baseHeaders,
+      {
+        signal,
+        streamBufferMode: 'disk',
+        returnTempFile: true,
+        networkReadRetries: 3,
+        retryBaseDelayMs: 1500,
+        onProgressCheckpoint: ({ percent, receivedBytes, totalBytes: checkpointTotalBytes }) => {
+          sendDebugLog(
+            tabId,
+            messageId,
+            `ChunkedOpfs: full download checkpoint ${percent}% (${formatByteCount(receivedBytes)} of ${formatByteCount(checkpointTotalBytes)}).`,
+            'info'
+          );
+        },
+        onRetry: ({ attempt, maxRetries, delayMs, phase, receivedBytes, totalBytes: retryTotalBytes }) => {
+          const progressLabel = retryTotalBytes
+            ? `${formatByteCount(receivedBytes)} of ${formatByteCount(retryTotalBytes)}`
+            : formatByteCount(receivedBytes);
+          sendDebugLog(
+            tabId,
+            messageId,
+            `ChunkedOpfs: download slipped during ${phase === 'resume request' ? 'resume' : 'read'} after ${progressLabel}; retrying ${attempt}/${maxRetries} in ${(delayMs / 1000).toFixed(1)}s.`,
+            'warn'
+          );
+        }
+      }
+    );
+
+    return extractChunkedProgressiveOpfsDemuxFromLocalOpfs({
+      streamUrl,
+      tabId,
+      messageId,
+      hints,
+      baseHeaders,
+      hostLabel,
+      preflightSample,
+      full
+    });
+  } finally {
+    if (full?.opfsTempName) {
+      await cleanupOpfsTempFile(full.opfsTempName);
+    }
+  }
+}
+
 async function fetchFullStreamBuffer(url, onProgress, baseHeaders = null, options = {}) {
   const signal = options?.signal || null;
   const returnTempFile = options?.returnTempFile === true;
+  const readIdleTimeoutMs = Math.max(30000, Number(options?.networkReadIdleTimeoutMs) || 120000);
   const fetchOpts = {
     ...(baseHeaders ? { headers: baseHeaders } : {}),
     ...(signal ? { signal } : {})
@@ -8009,9 +9333,12 @@ async function fetchFullStreamBuffer(url, onProgress, baseHeaders = null, option
     throwIfAborted(signal, `Full fetch aborted for ${url}`);
     let chunk;
     try {
-      chunk = await reader.read();
+      chunk = await readReaderChunkWithIdleTimeout(reader, readIdleTimeoutMs, signal);
     } catch (err) {
       if (isAbortError(err)) throw err;
+      if (isReadIdleTimeoutError(err)) {
+        try { await reader.cancel(err.message || 'read idle timeout'); } catch (_) { /* ignore */ }
+      }
       throw buildFullFetchPhaseError(url, res, 'network read', received, totalBytes, err);
     }
     const { done, value } = chunk;
@@ -8076,6 +9403,7 @@ async function getStreamBufferMode() {
 const OPFS_TEMP_FILE_PREFIX = 'submaker_stream';
 const OPFS_TEMP_FILE_SUFFIX = '.tmp';
 const OPFS_TEMP_SWEEP_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const OPFS_TEMP_DURATION_PROBE_BYTES = 16 * 1024 * 1024;
 let opfsTempSweepStarted = false;
 
 function createOpfsTempName(prefix = OPFS_TEMP_FILE_PREFIX) {
@@ -8130,6 +9458,57 @@ function isOpfsTempDemuxSource(buffer) {
   return !!(buffer && typeof buffer === 'object' && typeof buffer.opfsTempName === 'string' && buffer.opfsTempName.trim());
 }
 
+function getMediaSourceByteLength(source) {
+  if (!source) return 0;
+  if (typeof source?.byteLength === 'number' && source.byteLength > 0) return source.byteLength;
+  if (typeof source?.totalBytes === 'number' && source.totalBytes > 0) return source.totalBytes;
+  if (typeof source?.size === 'number' && source.size > 0) return source.size;
+  if (source instanceof ArrayBuffer) return source.byteLength || 0;
+  if (ArrayBuffer.isView(source)) return source.byteLength || 0;
+  return 0;
+}
+
+function buildOpfsTempTransferDescriptor(source) {
+  if (!isOpfsTempDemuxSource(source)) {
+    return null;
+  }
+  const opfsTempName = String(source.opfsTempName || '').trim();
+  const byteLength = getMediaSourceByteLength(source);
+  if (!opfsTempName || !byteLength) {
+    return null;
+  }
+  return {
+    opfsTempName,
+    byteLength,
+    totalBytes: Number(source?.totalBytes) || byteLength,
+    contentType: source?.contentType || ''
+  };
+}
+
+async function readOpfsTempFileBlob(tempName) {
+  const normalized = String(tempName || '').trim();
+  if (!normalized) {
+    throw new Error('Missing OPFS temp file name');
+  }
+  const root = await navigator.storage.getDirectory();
+  const fileHandle = await root.getFileHandle(normalized, { create: false });
+  return fileHandle.getFile();
+}
+
+async function probeDurationFromMediaSource(source) {
+  if (!source) return null;
+  if (isOpfsTempDemuxSource(source)) {
+    try {
+      const slice = await readOpfsTempFileSlice(source.opfsTempName, OPFS_TEMP_DURATION_PROBE_BYTES, 0);
+      return probeContainerDuration(slice?.buffer) || estimateDurationFromBytes(getMediaSourceByteLength(source));
+    } catch (err) {
+      console.warn('[Background] probeDurationFromMediaSource(OPFS) failed:', err?.message || err);
+      return estimateDurationFromBytes(getMediaSourceByteLength(source));
+    }
+  }
+  return probeContainerDuration(source) || estimateDurationFromBytes(getMediaSourceByteLength(source));
+}
+
 async function cleanupOpfsTempFile(tempName) {
   const normalized = String(tempName || '').trim();
   if (!normalized) return;
@@ -8164,6 +9543,7 @@ scheduleOpfsTempSweep();
 async function fetchFullStreamBufferOPFS(url, onProgress, baseHeaders = null, options = {}) {
   const signal = options?.signal || null;
   const returnTempFile = options?.returnTempFile === true;
+  const readIdleTimeoutMs = Math.max(30000, Number(options?.networkReadIdleTimeoutMs) || 120000);
   const requestedRetryCount = Number(options?.networkReadRetries);
   const maxReadRetries = Number.isFinite(requestedRetryCount)
     ? Math.max(1, Math.min(3, Math.floor(requestedRetryCount)))
@@ -8218,10 +9598,34 @@ async function fetchFullStreamBufferOPFS(url, onProgress, baseHeaders = null, op
   let root, fileHandle, writable;
 
   try {
-    try {
+    const openWritable = async (resumeBytes = 0, keepExistingData = false) => {
       root = await navigator.storage.getDirectory();
       fileHandle = await root.getFileHandle(tempName, { create: true });
-      writable = await fileHandle.createWritable();
+      writable = keepExistingData
+        ? await fileHandle.createWritable({ keepExistingData: true })
+        : await fileHandle.createWritable();
+      if (resumeBytes > 0) {
+        if (typeof writable.seek !== 'function') {
+          throw new Error('OPFS writable stream does not support seek');
+        }
+        await writable.seek(resumeBytes);
+      }
+      return writable;
+    };
+
+    const measureCommittedBytes = async () => {
+      try {
+        root = root || await navigator.storage.getDirectory();
+        fileHandle = fileHandle || await root.getFileHandle(tempName, { create: true });
+        const file = await fileHandle.getFile();
+        return Number(file?.size) || 0;
+      } catch (_) {
+        return 0;
+      }
+    };
+
+    try {
+      await openWritable(0, false);
     } catch (err) {
       throw buildFullFetchPhaseError(url, res, 'disk buffer setup', 0, totalBytes, err);
     }
@@ -8327,13 +9731,67 @@ async function fetchFullStreamBufferOPFS(url, onProgress, baseHeaders = null, op
       return { ok: false, phase: lastPhase, error: lastDetail };
     };
 
+    const tryRecoverWritable = async (phase, detail) => {
+      let attempt = 0;
+      let lastError = detail;
+
+      while (attempt < maxReadRetries) {
+        attempt += 1;
+        const delayMs = computeFetchRetryDelay(attempt, retryBaseDelayMs);
+        try {
+          await onRetry?.({
+            attempt,
+            maxRetries: maxReadRetries,
+            delayMs,
+            phase,
+            detail: lastError?.message || String(lastError || ''),
+            receivedBytes: received,
+            totalBytes,
+            resumeBytes: received
+          });
+        } catch (_) { /* ignore logging callback failures */ }
+        await waitWithAbort(delayMs, signal);
+
+        try {
+          if (reader && typeof reader.cancel === 'function') {
+            try { await reader.cancel(`${phase} recovery`); } catch (_) { /* ignore */ }
+          }
+          reader = null;
+          if (writable) {
+            try { await writable.close(); } catch (_) { /* ignore */ }
+          }
+          writable = null;
+
+          const committedBytes = await measureCommittedBytes();
+          if (committedBytes >= 0 && committedBytes < received) {
+            received = committedBytes;
+          }
+
+          await openWritable(received, true);
+          const resumed = await tryResumeReader(phase, detail);
+          if (resumed.ok) {
+            return resumed;
+          }
+          lastError = resumed.error || detail;
+        } catch (recoveryErr) {
+          if (isAbortError(recoveryErr)) throw recoveryErr;
+          lastError = recoveryErr;
+        }
+      }
+
+      return { ok: false, phase, error: lastError };
+    };
+
     while (true) {
       throwIfAborted(signal, `Full fetch aborted for ${url}`);
       let chunk;
       try {
-        chunk = await reader.read();
+        chunk = await readReaderChunkWithIdleTimeout(reader, readIdleTimeoutMs, signal);
       } catch (err) {
         if (isAbortError(err)) throw err;
+        if (isReadIdleTimeoutError(err)) {
+          try { await reader.cancel(err.message || 'read idle timeout'); } catch (_) { /* ignore */ }
+        }
         const resumed = await tryResumeReader('network read', err);
         if (resumed.ok) {
           if (resumed.complete) break;
@@ -8370,8 +9828,13 @@ async function fetchFullStreamBufferOPFS(url, onProgress, baseHeaders = null, op
         try {
           await writable.write(value);
         } catch (err) {
+          const recovered = await tryRecoverWritable('disk write', err);
+          if (recovered.ok) {
+            if (recovered.complete) break;
+            continue;
+          }
           throw attachPartialOpfsTempToError(
-            buildFullFetchPhaseError(url, res, 'disk write', received, totalBytes, err),
+            buildFullFetchPhaseError(url, res, recovered.phase || 'disk write', received, totalBytes, recovered.error || err),
             tempName,
             received,
             totalBytes,
@@ -8922,6 +10385,10 @@ function normalizeBufferForTransfer(buffer) {
 
 const MAX_DIRECT_OFFSCREEN_BYTES = 4 * 1024 * 1024; // keep direct messages comfortably under runtime cap
 const OFFSCREEN_CHUNK_BYTES = 512 * 1024; // larger chunks to cut transfer time without hitting message caps
+const DIRECT_OFFSCREEN_DEMUX_TIMEOUT_MS = 3 * 60 * 1000;
+const OPFS_OFFSCREEN_DEMUX_BASE_TIMEOUT_MS = 12 * 60 * 1000;
+const OPFS_OFFSCREEN_DEMUX_MAX_TIMEOUT_MS = 30 * 60 * 1000;
+const OPFS_OFFSCREEN_DEMUX_EXTRA_TIMEOUT_PER_GIB_MS = 6 * 60 * 1000;
 
 function isMessageLengthError(err) {
   const msg = err?.message || '';
@@ -8931,6 +10398,22 @@ function isMessageLengthError(err) {
 function isMissingOffscreenReceiver(err) {
   const msg = err?.message || '';
   return /receiving end does not exist|could not establish connection/i.test(msg);
+}
+
+function computeBackgroundOffscreenDemuxTimeoutMs(byteLength, isOpfsPayload) {
+  if (!isOpfsPayload) {
+    return DIRECT_OFFSCREEN_DEMUX_TIMEOUT_MS;
+  }
+  const oneGiB = 1024 * 1024 * 1024;
+  const bytes = Math.max(0, Number(byteLength) || 0);
+  if (bytes <= oneGiB) {
+    return OPFS_OFFSCREEN_DEMUX_BASE_TIMEOUT_MS;
+  }
+  const extraGiB = Math.ceil((bytes - oneGiB) / oneGiB);
+  return Math.min(
+    OPFS_OFFSCREEN_DEMUX_MAX_TIMEOUT_MS,
+    OPFS_OFFSCREEN_DEMUX_BASE_TIMEOUT_MS + (extraGiB * OPFS_OFFSCREEN_DEMUX_EXTRA_TIMEOUT_PER_GIB_MS)
+  );
 }
 
 async function sendBufferToOffscreenInChunks(uintPayload, messageId, tabId) {
@@ -9601,11 +11084,37 @@ function filterTextTracksOnly(tracks) {
   return tracks.filter((t) => t && !(t.binary || t.codec === 'copy' || (typeof t.mime === 'string' && t.mime.toLowerCase().includes('matroska')) || t.source === 'copy'));
 }
 
+const OFFSCREEN_DEMUX_KEEPALIVE_MS = 60 * 1000;
+
+function startExtractKeepalive(tabId, messageId, progress, status, intervalMs = OFFSCREEN_DEMUX_KEEPALIVE_MS) {
+  const normalizedStatus = String(status || '').trim();
+  const normalizedProgress = Number(progress);
+  const delayMs = Math.max(15000, Number(intervalMs) || OFFSCREEN_DEMUX_KEEPALIVE_MS);
+  if (!tabId || !messageId || !normalizedStatus || !Number.isFinite(normalizedProgress)) {
+    return () => {};
+  }
+
+  const timer = setInterval(() => {
+    sendExtractProgress(tabId, messageId, normalizedProgress, normalizedStatus);
+  }, delayMs);
+
+  return () => {
+    clearInterval(timer);
+  };
+}
+
 async function demuxSubtitlesOffscreen(buffer, messageId, tabId, options = {}) {
   const endOffscreen = startOffscreenSession();
   const startedAt = Date.now();
   const signal = options?.signal || getExtractJobSignal(messageId);
   const abortReason = options?.abortReason || 'Extraction cancelled';
+  const stopKeepalive = startExtractKeepalive(
+    tabId,
+    messageId,
+    options?.keepaliveProgress,
+    options?.keepaliveStatus,
+    options?.keepaliveIntervalMs
+  );
   try {
     throwIfAborted(signal, abortReason);
     await ensureOffscreenDocument();
@@ -9650,7 +11159,7 @@ async function demuxSubtitlesOffscreen(buffer, messageId, tabId, options = {}) {
       });
     }
     logOffscreenLifecycle('demux:start', { messageId, bytes: sendBytes });
-    const timeoutMs = opfsPayload ? 12 * 60 * 1000 : 180000; // keep background ahead of the offscreen OPFS watchdog
+    const timeoutMs = computeBackgroundOffscreenDemuxTimeoutMs(sendBytes, !!opfsPayload);
     const { promise: pushedResponse, cancel: cancelPushWait } = waitForOffscreenResult(messageId, timeoutMs + 20000, signal);
     let cancelDirect = null;
     const sendDemuxRequest = (payload) => new Promise((resolve, reject) => {
@@ -9708,6 +11217,13 @@ async function demuxSubtitlesOffscreen(buffer, messageId, tabId, options = {}) {
     let response;
     let lastError = null;
     const mustChunk = !opfsPayload && sendBytes > MAX_DIRECT_OFFSCREEN_BYTES;
+    const sharedDemuxRequestOptions = {
+      ...(Array.isArray(options?.inputArgs) && options.inputArgs.length ? { inputArgs: options.inputArgs } : {}),
+      ...(options?.skipCopyTracks === true ? { skipCopyTracks: true } : {}),
+      ...(options?.skipFlatCueRepair === true ? { skipFlatCueRepair: true } : {}),
+      ...(Array.isArray(options?.streamPlans) && options.streamPlans.length ? { streamPlans: options.streamPlans } : {}),
+      ...(Array.isArray(options?.textStreamPlans) && options.textStreamPlans.length ? { textStreamPlans: options.textStreamPlans } : {})
+    };
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
@@ -9718,7 +11234,8 @@ async function demuxSubtitlesOffscreen(buffer, messageId, tabId, options = {}) {
               messageId,
               transferMethod: 'opfs',
               opfsTempName: opfsPayload.opfsTempName,
-              byteLength: opfsPayload.byteLength
+              byteLength: opfsPayload.byteLength,
+              ...sharedDemuxRequestOptions
             });
           } else if (mustChunk) {
             const Transfer = await ensureTransferHelper();
@@ -9732,13 +11249,15 @@ async function demuxSubtitlesOffscreen(buffer, messageId, tabId, options = {}) {
               type: 'OFFSCREEN_FFMPEG_EXTRACT',
               messageId,
               transferId,
-              transferMethod: 'idb'
+              transferMethod: 'idb',
+              ...sharedDemuxRequestOptions
             });
           } else {
             response = await sendDemuxRequest({
               type: 'OFFSCREEN_FFMPEG_EXTRACT',
               messageId,
-              buffer: uintPayload
+              buffer: uintPayload,
+              ...sharedDemuxRequestOptions
             });
           }
           break; // success, stop retry loop
@@ -9757,7 +11276,8 @@ async function demuxSubtitlesOffscreen(buffer, messageId, tabId, options = {}) {
               type: 'OFFSCREEN_FFMPEG_EXTRACT',
               messageId,
               transferId,
-              transferMethod: 'idb'
+              transferMethod: 'idb',
+              ...sharedDemuxRequestOptions
             });
             break;
           }
@@ -9838,6 +11358,7 @@ async function demuxSubtitlesOffscreen(buffer, messageId, tabId, options = {}) {
       cancelPushWait();
     }
   } finally {
+    stopKeepalive();
     endOffscreen();
   }
 }

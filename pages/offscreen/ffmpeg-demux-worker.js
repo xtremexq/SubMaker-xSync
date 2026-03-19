@@ -40,8 +40,42 @@ function isLowSignalWorkerLog(text) {
     || /^stream map '0:s:\d+' matches no streams\.$/.test(lower)
     || /^to ignore this, add a trailing '\?' to the map\.$/.test(lower)
     || /^output file is empty, nothing was encoded /.test(lower)
+    || /guessed channel layout for input stream #\d+:\d+ : /.test(lower)
+    || /error initializing output stream \d+:\d+ -- subtitle encoding currently only possible from text to text or bitmap to bitmap/.test(lower)
     || /\[ass @ .*?\] readorder gap found between \d+ and \d+/.test(lower)
     || /readorder gap found between \d+ and \d+/.test(lower);
+}
+
+function splitWorkerLogLines(text) {
+  return String(text || '')
+    .split(/\r?\n+/)
+    .map((entry) => normalizeWorkerLogText(entry))
+    .filter(Boolean);
+}
+
+function classifyWorkerFfmpegError(text, fallback = 'FFmpeg failed') {
+  const lines = splitWorkerLogLines(text);
+  const joined = lines.join(' ');
+  const lower = joined.toLowerCase();
+  if (!lower) {
+    return { category: 'generic', summary: fallback };
+  }
+  if (lower.includes('subtitle encoding currently only possible from text to text or bitmap to bitmap')) {
+    return {
+      category: 'subtitle-kind-mismatch',
+      summary: 'FFmpeg reported that this subtitle stream cannot be converted directly to text output.'
+    };
+  }
+  if (/matches no streams|does not contain any stream|output file does not contain any stream|stream map/.test(lower)) {
+    return {
+      category: 'missing-stream',
+      summary: 'FFmpeg reported that the requested subtitle stream was not present in this input.'
+    };
+  }
+  const useful = lines.filter((line) => !isLowSignalWorkerLog(line));
+  const summary = useful[useful.length - 1] || lines[lines.length - 1] || fallback;
+  const compact = summary.length > 240 ? `${summary.slice(0, 237)}...` : summary;
+  return { category: 'generic', summary: compact };
 }
 
 function sendLog(message, level = 'info') {
@@ -63,13 +97,15 @@ function buildRunError(ret, fallbackLabel) {
   const stderrLines = lastRunLogs
     .filter((entry) => String(entry?.type || '').toLowerCase().includes('stderr') && entry?.message)
     .map((entry) => String(entry.message || '').trim())
-    .filter(Boolean)
-    .slice(-12);
-  const message = stderrLines.length
-    ? stderrLines.join('\n')
-    : `${fallbackLabel} exited with code ${ret}`;
+    .filter(Boolean);
+  const classified = classifyWorkerFfmpegError(
+    stderrLines.slice(-12).join('\n'),
+    `${fallbackLabel} exited with code ${ret}`
+  );
+  const message = classified.summary || `${fallbackLabel} exited with code ${ret}`;
   const err = new Error(message);
   err.code = ret;
+  err.ffmpegCategory = classified.category;
   err.ffmpegLogs = lastRunLogs.slice();
   return err;
 }
@@ -541,6 +577,7 @@ async function extractSubtitleTextTracksSequential(module, inputName, opts = {})
   const targets = getSubtitleExtractionTargets(opts);
   const outputArgs = Array.isArray(opts.outputArgs) ? opts.outputArgs : [];
   const inputArgs = Array.isArray(opts.inputArgs) ? opts.inputArgs : [];
+  let skippedKindMismatches = 0;
   for (const target of targets) {
     const streamIndex = target.streamIndex;
     const outputIndex = target.outputIndex;
@@ -573,8 +610,19 @@ async function extractSubtitleTextTracksSequential(module, inputName, opts = {})
         extracted.push(outName);
         continue;
       }
-      sendLog(`Text subtitle conversion failed for stream ${streamIndex + 1}: ${err?.message || err}`, 'warn');
+      const classified = classifyWorkerFfmpegError(err?.message || err, 'FFmpeg failed to convert the subtitle stream to text output.');
+      if (classified.category === 'subtitle-kind-mismatch') {
+        skippedKindMismatches += 1;
+        continue;
+      }
+      sendLog(`Text subtitle conversion failed for stream ${streamIndex + 1}: ${classified.summary}`, 'warn');
     }
+  }
+  if (skippedKindMismatches > 0) {
+    sendLog(
+      `Skipped direct text extraction for ${skippedKindMismatches} stream(s) that FFmpeg reported as non-text/bitmap mismatches.`,
+      'info'
+    );
   }
   return extracted;
 }
@@ -611,7 +659,11 @@ async function extractSubtitleTextTracks(module, inputName, opts = {}) {
     }
     await ffmpegRun(module, argv);
   } catch (err) {
-    sendLog(`Batch text extraction failed; retrying streams individually (${err?.message || err})`, 'warn');
+    const classified = classifyWorkerFfmpegError(err?.message || err, 'FFmpeg batch text extraction failed.');
+    const retryReason = classified.category === 'subtitle-kind-mismatch'
+      ? 'FFmpeg hit one or more streams that cannot be converted directly to text output.'
+      : classified.summary;
+    sendLog(`Batch text extraction failed; retrying streams individually (${retryReason})`, 'warn');
     return await extractSubtitleTextTracksSequential(module, inputName, opts);
   }
 
@@ -705,6 +757,66 @@ function readCopyTrack(module, file) {
   };
 }
 
+async function runAudioDecode(payload) {
+  const module = await ensureFfmpegCore(payload);
+  const byteLength = Number(payload?.source?.byteLength) || 0;
+  const sizeMb = Math.round((byteLength / (1024 * 1024)) * 10) / 10;
+  const windows = Array.isArray(payload?.windows) ? payload.windows : [];
+  if (!windows.length) {
+    throw new Error('Dedicated audio worker received no decode windows.');
+  }
+  const audioStreamIndex = Number.isInteger(payload?.audioStreamIndex) ? payload.audioStreamIndex : 0;
+  sendLog(`Starting dedicated audio decode worker (${payload?.source?.kind === 'file' ? 'mounted file' : 'buffer'} ~${sizeMb} MB, windows=${windows.length})`, 'info');
+
+  let inputSource = null;
+  try {
+    inputSource = await buildInputSource(module, payload.source);
+    const results = [];
+    for (let i = 0; i < windows.length; i++) {
+      const win = windows[i] || {};
+      const outputName = `audio_decode_${i}.wav`;
+      cleanupFsFile(module, outputName);
+      const args = ['-y'];
+      if (typeof win.seekToSec === 'number' && win.seekToSec > 0) {
+        args.push('-ss', String(win.seekToSec));
+      }
+      args.push('-i', inputSource.inputName, '-vn');
+      if (Number.isInteger(audioStreamIndex) && audioStreamIndex >= 0) {
+        args.push('-map', `0:a:${audioStreamIndex}`);
+      }
+      args.push('-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1');
+      if (typeof win.durSec === 'number' && win.durSec > 0) {
+        args.push('-t', String(win.durSec));
+      }
+      args.push(outputName);
+      await ffmpegRun(module, args);
+      const data = ffmpegFs(module, 'readFile', outputName);
+      if (!data?.byteLength) {
+        throw new Error(`FFmpeg produced empty audio for window ${i + 1}`);
+      }
+      if (data.byteLength < 44) {
+        throw new Error(`FFmpeg produced too-small audio for window ${i + 1} (${data.byteLength} bytes)`);
+      }
+      const cloned = data instanceof Uint8Array ? data.slice() : new Uint8Array(data || []);
+      results.push({
+        audioBytes: cloned.buffer,
+        startMs: Math.round(((win.startSec ?? win.seekToSec ?? 0) || 0) * 1000)
+      });
+      cleanupFsFile(module, outputName);
+    }
+    return { audioWindows: results };
+  } finally {
+    try {
+      for (const file of ffmpegFs(module, 'readdir', '/')) {
+        if (/^audio_decode_\d+\.wav$/i.test(file)) {
+          cleanupFsFile(module, file);
+        }
+      }
+      inputSource?.cleanup?.();
+    } catch (_) { /* ignore */ }
+  }
+}
+
 async function runDemux(payload) {
   const module = await ensureFfmpegCore(payload);
   const byteLength = Number(payload?.source?.byteLength) || 0;
@@ -712,6 +824,11 @@ async function runDemux(payload) {
   sendLog(`Starting dedicated demux worker (${payload?.source?.kind === 'file' ? 'mounted file' : 'buffer'} ~${sizeMb} MB)`, 'info');
   const hasExplicitStreamPlans = Array.isArray(payload?.streamPlans) && payload.streamPlans.length > 0;
   const hasExplicitTextPlans = Array.isArray(payload?.textStreamPlans) && payload.textStreamPlans.length > 0;
+  const inputArgs = Array.isArray(payload?.inputArgs) && payload.inputArgs.length
+    ? payload.inputArgs
+    : ['-analyzeduration', '60M', '-probesize', '60M'];
+  const skipCopyTracks = payload?.skipCopyTracks === true;
+  const skipFlatCueRepair = payload?.skipFlatCueRepair === true;
   const copyStreamPlans = hasExplicitStreamPlans
     ? payload.streamPlans.filter((entry) => entry && entry.kind !== 'text')
     : null;
@@ -726,7 +843,7 @@ async function runDemux(payload) {
     inputName = inputSource.inputName;
 
     sendLog('Running FFmpeg to extract subtitle streams...', 'info');
-    if (!hasExplicitStreamPlans || copyStreamPlans.length) {
+    if ((!hasExplicitStreamPlans || copyStreamPlans.length) && !skipCopyTracks) {
       copiedTracks = await extractSubtitleCopyTracks(module, inputName, copyStreamPlans ? {
         streamPlans: copyStreamPlans
       } : {});
@@ -734,16 +851,17 @@ async function runDemux(payload) {
     if (hasExplicitTextPlans || !hasExplicitStreamPlans) {
       files = await extractSubtitleTextTracks(module, inputName, {
         streamPlans: hasExplicitTextPlans ? payload.textStreamPlans : undefined,
-        inputArgs: ['-analyzeduration', '60M', '-probesize', '60M']
+        inputArgs
       });
     }
 
     if (copiedTracks.length) {
-      sendLog(`Preserved ${copiedTracks.length} subtitle stream(s) as MKV copy for fallback/OCR`, 'info');
+      sendLog(`Preserved ${copiedTracks.length} subtitle stream(s) as MKV copy for bitmap-only detection.`, 'info');
     }
 
     if (copiedTracks.length) {
       const existingIds = new Set(files.map((file) => parseExtractedOutputIndex(file)).filter((value) => Number.isInteger(value) && value > 0));
+      let skippedCopyTextConversions = 0;
       for (const copyName of copiedTracks) {
         const trackIdx = parseExtractedOutputIndex(copyName);
         if (Number.isInteger(trackIdx) && existingIds.has(trackIdx)) {
@@ -771,8 +889,19 @@ async function runDemux(payload) {
           }
         } catch (convErr) {
           cleanupFsFile(module, textName);
-          sendLog(`Failed to convert ${copyName} to text subtitle output: ${convErr?.message || convErr}`, 'warn');
+          const classified = classifyWorkerFfmpegError(convErr?.message || convErr, 'FFmpeg could not convert the copied subtitle stream to text output.');
+          if (classified.category === 'subtitle-kind-mismatch') {
+            skippedCopyTextConversions += 1;
+            continue;
+          }
+          sendLog(`Failed to convert ${copyName} to text subtitle output: ${classified.summary}`, 'warn');
         }
+      }
+      if (skippedCopyTextConversions > 0) {
+        sendLog(
+          `Left ${skippedCopyTextConversions} copied subtitle stream(s) as MKV because FFmpeg could not convert them directly to text output.`,
+          'info'
+        );
       }
       files = files.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
     }
@@ -786,7 +915,9 @@ async function runDemux(payload) {
       });
 
       const timelineStatus = analyzeCueTimelines(tracks);
-      if (timelineStatus.flatCueStarts || timelineStatus.nonMonotonicCues) {
+      if (timelineStatus.flatCueStarts && skipFlatCueRepair && !timelineStatus.nonMonotonicCues) {
+        sendLog('Detected flat cue timestamps in a bounded demux pass; skipping PTS normalization for this slice.', 'info');
+      } else if (timelineStatus.flatCueStarts || timelineStatus.nonMonotonicCues) {
         sendLog(`Detected ${timelineStatus.flatCueStarts ? 'flat' : 'non-monotonic'} cue timestamps; retrying with PTS normalization...`, 'warn');
         try {
           for (const file of ffmpegFs(module, 'readdir', '/')) {
@@ -842,7 +973,7 @@ async function runDemux(payload) {
       }
 
       const postNormStatus = analyzeCueTimelines(tracks);
-      if (postNormStatus.flatCueStarts || postNormStatus.nonMonotonicCues) {
+      if (postNormStatus.nonMonotonicCues || (postNormStatus.flatCueStarts && !skipFlatCueRepair)) {
         sendLog('Timelines still broken after PTS normalization; trying per-stream remux...', 'warn');
         try {
           const remuxed = [];
@@ -964,11 +1095,22 @@ self.onmessage = async (event) => {
   }
   currentRequestId = payload.messageId || null;
   try {
-    const result = await runDemux(payload);
+    const action = payload?.action === 'audio-decode' ? 'audio-decode' : 'demux';
+    const result = action === 'audio-decode'
+      ? await runAudioDecode(payload)
+      : await runDemux(payload);
     const transfer = [];
-    for (const track of result.copyTracks || []) {
-      if (track?.data instanceof ArrayBuffer) {
-        transfer.push(track.data);
+    if (action === 'audio-decode') {
+      for (const win of result.audioWindows || []) {
+        if (win?.audioBytes instanceof ArrayBuffer) {
+          transfer.push(win.audioBytes);
+        }
+      }
+    } else {
+      for (const track of result.copyTracks || []) {
+        if (track?.data instanceof ArrayBuffer) {
+          transfer.push(track.data);
+        }
       }
     }
     self.postMessage({ type: 'RESULT', result }, transfer);

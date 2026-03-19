@@ -47,6 +47,10 @@ const OUTGOING_CHUNK_BYTES = 512 * 1024;
 const OUTGOING_CHUNK_THRESHOLD = 2.5 * 1024 * 1024; // approx 2.5MB before chunking
 const OFFSCREEN_LOG_BUCKET_LIMIT = 400;
 const FFMPEG_GLOBAL_ARGS = ['-hide_banner', '-nostats', '-loglevel', 'warning'];
+const DIRECT_DEMUX_TIMEOUT_MS = 90 * 1000;
+const OPFS_DEMUX_BASE_TIMEOUT_MS = 10 * 60 * 1000;
+const OPFS_DEMUX_MAX_TIMEOUT_MS = 24 * 60 * 1000;
+const OPFS_DEMUX_EXTRA_TIMEOUT_PER_GIB_MS = 6 * 60 * 1000;
 
 const DEBUG_FLAG_KEY = 'debugLogsEnabled';
 function refreshDebugFlag() {
@@ -113,9 +117,59 @@ function isLowSignalFfmpegLog(text) {
     || /^stream map '0:s:\d+' matches no streams\.$/.test(lower)
     || /^to ignore this, add a trailing '\?' to the map\.$/.test(lower)
     || /^output file is empty, nothing was encoded /.test(lower)
+    || /guessed channel layout for input stream #\d+:\d+ : /.test(lower)
+    || /error initializing output stream \d+:\d+ -- subtitle encoding currently only possible from text to text or bitmap to bitmap/.test(lower)
     || /non-monotonous dts in output stream/.test(lower)
     || /\[ass @ .*?\] readorder gap found between \d+ and \d+/.test(lower)
     || /readorder gap found between \d+ and \d+/.test(lower);
+}
+
+function splitOffscreenLogLines(text) {
+  return String(text || '')
+    .split(/\r?\n+/)
+    .map((entry) => normalizeOffscreenLogText(entry))
+    .filter(Boolean);
+}
+
+function computeOffscreenDemuxTimeoutMs(transferMethod, byteLength) {
+  if (transferMethod !== 'opfs') {
+    return DIRECT_DEMUX_TIMEOUT_MS;
+  }
+  const oneGiB = 1024 * 1024 * 1024;
+  const bytes = Math.max(0, Number(byteLength) || 0);
+  if (bytes <= oneGiB) {
+    return OPFS_DEMUX_BASE_TIMEOUT_MS;
+  }
+  const extraGiB = Math.ceil((bytes - oneGiB) / oneGiB);
+  return Math.min(
+    OPFS_DEMUX_MAX_TIMEOUT_MS,
+    OPFS_DEMUX_BASE_TIMEOUT_MS + (extraGiB * OPFS_DEMUX_EXTRA_TIMEOUT_PER_GIB_MS)
+  );
+}
+
+function classifyOffscreenFfmpegError(text, fallback = 'FFmpeg failed') {
+  const lines = splitOffscreenLogLines(text);
+  const joined = lines.join(' ');
+  const lower = joined.toLowerCase();
+  if (!lower) {
+    return { category: 'generic', summary: fallback };
+  }
+  if (lower.includes('subtitle encoding currently only possible from text to text or bitmap to bitmap')) {
+    return {
+      category: 'subtitle-kind-mismatch',
+      summary: 'FFmpeg reported that this subtitle stream cannot be converted directly to text output.'
+    };
+  }
+  if (/matches no streams|does not contain any stream|output file does not contain any stream|stream map/.test(lower)) {
+    return {
+      category: 'missing-stream',
+      summary: 'FFmpeg reported that the requested subtitle stream was not present in this input.'
+    };
+  }
+  const useful = lines.filter((line) => !isLowSignalFfmpegLog(line));
+  const summary = useful[useful.length - 1] || lines[lines.length - 1] || fallback;
+  const compact = summary.length > 240 ? `${summary.slice(0, 237)}...` : summary;
+  return { category: 'generic', summary: compact };
 }
 
 function shouldSuppressOffscreenLog(text, level = 'info', messageId) {
@@ -216,6 +270,12 @@ function beginOffscreenJob(messageId) {
 
 function finishOffscreenJob(messageId) {
   if (!messageId) return;
+  const workerEntry = _activeDemuxWorkers.get(messageId);
+  if (workerEntry) {
+    _activeDemuxWorkers.delete(messageId);
+    try { workerEntry.worker?.terminate?.(); } catch (_) { /* ignore */ }
+    try { workerEntry.reject?.(createAbortError('Offscreen job finished')); } catch (_) { /* ignore */ }
+  }
   _activeOffscreenJobs.delete(messageId);
   _offscreenLogSeen.delete(messageId);
 }
@@ -565,12 +625,19 @@ function readVint(u8, offset) {
     length += 1;
     mask >>= 1;
   }
-  if (length > 8) return null;
-  let value = first & (mask - 1);
+  if (length > 8 || offset + length > u8.length) return null;
+  let value = BigInt(first & (mask - 1));
   for (let i = 1; i < length; i++) {
-    value = (value << 8) | u8[offset + i];
+    value = (value * 256n) + BigInt(u8[offset + i]);
   }
-  return { length, value };
+  const unknownValue = (1n << BigInt(7 * length)) - 1n;
+  return {
+    length,
+    value: value > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(value),
+    valueBigInt: value,
+    isUnknownSize: value === unknownValue,
+    exceedsSafeInteger: value > BigInt(Number.MAX_SAFE_INTEGER)
+  };
 }
 
 function readEbmlElement(u8, offset, limit) {
@@ -587,7 +654,7 @@ function readEbmlElement(u8, offset, limit) {
   const dataStart = offset + idInfo.length + sizeInfo.length;
   let size = sizeInfo.value;
   // Unknown-size EBML elements set all size bits; treat as consuming the remaining scan window
-  if (size === (Math.pow(2, 7 * sizeInfo.length) - 1)) {
+  if (sizeInfo.isUnknownSize || sizeInfo.exceedsSafeInteger) {
     size = Math.max(0, limit - dataStart);
   }
   let dataEnd = dataStart + size;
@@ -654,9 +721,9 @@ function parseMkvHeaderInfo(buffer, opts = {}) {
   };
 
   function parseUint(u8Arr, start, end) {
-    let v = 0;
-    for (let i = start; i < end; i++) v = (v << 8) | u8Arr[i];
-    return v >>> 0;
+    let v = 0n;
+    for (let i = start; i < end; i++) v = (v * 256n) + BigInt(u8Arr[i]);
+    return v > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(v);
   }
 
   function parseString(u8Arr, start, end) {
@@ -1300,8 +1367,17 @@ function isSubtitleAttachmentFile(att) {
 function probeMkvSubtitleMetadata(buffer) {
   if (!buffer || typeof buffer.byteLength !== 'number' || buffer.byteLength === 0) return null;
   try {
-    const scanBytes = Math.min(buffer.byteLength, 24 * 1024 * 1024);
-    const headerInfo = parseMkvHeaderInfo(buffer, { maxScanBytes: scanBytes });
+    const shallowScanBytes = Math.min(buffer.byteLength, 24 * 1024 * 1024);
+    let scanBytes = shallowScanBytes;
+    let headerInfo = parseMkvHeaderInfo(buffer, { maxScanBytes: scanBytes });
+    const initialTracks = Array.isArray(headerInfo?.tracks) ? headerInfo.tracks : [];
+    if (!initialTracks.length && buffer.byteLength > shallowScanBytes) {
+      const deepScanBytes = Math.min(buffer.byteLength, 96 * 1024 * 1024);
+      if (deepScanBytes > shallowScanBytes) {
+        scanBytes = deepScanBytes;
+        headerInfo = parseMkvHeaderInfo(buffer, { maxScanBytes: scanBytes });
+      }
+    }
     const tracks = Array.isArray(headerInfo?.tracks) ? headerInfo.tracks : [];
     const subtitleTracks = tracks.filter((t) => {
       const codec = String(t?.codecId || '').toLowerCase();
@@ -1537,6 +1613,20 @@ let _paddleOcrReady = false;
 let _paddleOcrLoading = null;
 let _paddleCvReady = false;
 let _tesseractLoading = null;
+
+const IMAGE_SUBTITLE_OCR_NOT_IMPLEMENTED_MESSAGE = 'Image-based subtitle streams were detected, but OCR extraction is not implemented yet.';
+
+function throwImageSubtitleOcrNotImplemented(messageId, copyTrackCount = 0) {
+  const countLabel = copyTrackCount > 0
+    ? `${copyTrackCount} image-based subtitle stream(s)`
+    : 'image-based subtitle streams';
+  sendOffscreenLog(
+    `Detected ${countLabel} (likely PGS/VobSub). OCR extraction is not implemented yet, so the job stops here.`,
+    'error',
+    messageId
+  );
+  throw new Error(IMAGE_SUBTITLE_OCR_NOT_IMPLEMENTED_MESSAGE);
+}
 
 async function waitForOpencvReady(messageId) {
   if (_paddleCvReady) return;
@@ -1948,13 +2038,15 @@ async function loadBareFfmpegCore(messageId) {
     const stderrLines = lastRunLogs
       .filter((entry) => String(entry?.type || '').toLowerCase().includes('stderr') && entry?.message)
       .map((entry) => String(entry.message || '').trim())
-      .filter(Boolean)
-      .slice(-12);
-    const message = stderrLines.length
-      ? stderrLines.join('\n')
-      : `${fallbackLabel} exited with code ${ret}`;
+      .filter(Boolean);
+    const classified = classifyOffscreenFfmpegError(
+      stderrLines.slice(-12).join('\n'),
+      `${fallbackLabel} exited with code ${ret}`
+    );
+    const message = classified.summary || `${fallbackLabel} exited with code ${ret}`;
     const err = new Error(message);
     err.code = ret;
+    err.ffmpegCategory = classified.category;
     err.ffmpegLogs = lastRunLogs.slice();
     return err;
   };
@@ -2223,7 +2315,102 @@ async function runDemuxInWorker(source, messageId, opts = {}) {
             byteLength: Number(source?.byteLength) || file.size || 0
           },
           streamPlans: Array.isArray(opts.streamPlans) ? opts.streamPlans : [],
-          textStreamPlans: Array.isArray(opts.textStreamPlans) ? opts.textStreamPlans : []
+          textStreamPlans: Array.isArray(opts.textStreamPlans) ? opts.textStreamPlans : [],
+          inputArgs: Array.isArray(opts.inputArgs) ? opts.inputArgs : [],
+          skipFlatCueRepair: opts.skipFlatCueRepair === true,
+          skipCopyTracks: opts.skipCopyTracks === true
+        });
+      } catch (err) {
+        finish(reject, err, true);
+      }
+    })();
+  });
+}
+
+async function runAudioDecodeInWorker(source, windows, messageId, opts = {}) {
+  if (!isOpfsTempInputSource(source)) {
+    throw new Error('Audio decode worker requires an OPFS temp-file source');
+  }
+  const tempName = String(source.opfsTempName || '').trim();
+  if (!tempName) {
+    throw new Error('Missing OPFS temp file name for audio decode worker');
+  }
+
+  const root = await navigator.storage.getDirectory();
+  const fileHandle = await root.getFileHandle(tempName, { create: false });
+  const file = await fileHandle.getFile();
+  const workerUrl = chrome.runtime.getURL('pages/offscreen/ffmpeg-demux-worker.js');
+
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    let worker = null;
+    let revokeWorker = () => {};
+
+    const finish = (fn, value, terminateWorker = true) => {
+      if (settled) return;
+      settled = true;
+      if (_activeDemuxWorkers.get(messageId)?.worker === worker) {
+        _activeDemuxWorkers.delete(messageId);
+      }
+      if (worker) {
+        worker.onmessage = null;
+        worker.onerror = null;
+      }
+      if (terminateWorker && worker) {
+        try { worker.terminate(); } catch (_) { /* ignore */ }
+      }
+      try { revokeWorker(); } catch (_) { /* ignore */ }
+      fn(value);
+    };
+
+    (async () => {
+      try {
+        const booted = await bootDemuxWorker(workerUrl, messageId);
+        worker = booted.worker;
+        revokeWorker = typeof booted.revoke === 'function' ? booted.revoke : (() => {});
+
+        _activeDemuxWorkers.set(messageId, {
+          worker,
+          reject: (err) => finish(reject, err, true)
+        });
+
+        worker.onmessage = (event) => {
+          const data = event?.data || {};
+          if (data.type === 'LOG') {
+            sendOffscreenLog(data.message || '', data.level || 'info', messageId);
+            return;
+          }
+          if (data.type === 'RESULT') {
+            finish(resolve, data.result || {}, true);
+            return;
+          }
+          if (data.type === 'ERROR') {
+            finish(reject, new Error(data.error || 'Audio decode worker failed'), true);
+          }
+        };
+
+        worker.onerror = (event) => {
+          finish(reject, new Error(formatWorkerBootstrapError(event, 'runtime')), true);
+        };
+
+        worker.postMessage({
+          type: 'START',
+          action: 'audio-decode',
+          coreUrl: chrome.runtime.getURL('assets/lib/ffmpeg-core.js'),
+          wasmUrl: chrome.runtime.getURL('assets/lib/ffmpeg-core.wasm'),
+          coreWorkerUrl: chrome.runtime.getURL('assets/lib/ffmpeg-core.worker.js'),
+          messageId,
+          audioStreamIndex: Number.isInteger(opts?.audioStreamIndex) ? opts.audioStreamIndex : 0,
+          source: {
+            kind: 'file',
+            file,
+            byteLength: Number(source?.byteLength) || file.size || 0
+          },
+          windows: (windows || []).map((win) => ({
+            startSec: win?.startSec,
+            durSec: win?.durSec,
+            seekToSec: win?.seekToSec
+          }))
         });
       } catch (err) {
         finish(reject, err, true);
@@ -2236,75 +2423,53 @@ async function runOcrOnBinaryCopiedTracks(copyTracks, messageId) {
   if (!Array.isArray(copyTracks) || !copyTracks.length) {
     return [];
   }
-  const ffmpeg = await getFFmpeg(messageId);
-  const writtenFiles = [];
-  try {
-    for (const track of copyTracks) {
-      const name = String(track?.label || track?.fileName || '').trim();
-      const data = track?.data instanceof Uint8Array
-        ? track.data
-        : (track?.data ? new Uint8Array(track.data) : null);
-      if (!name || !data?.byteLength) {
-        continue;
-      }
-      cleanupFsFile(ffmpeg, name);
-      ffmpeg.FS('writeFile', name, data);
-      writtenFiles.push(name);
-    }
-
-    if (!writtenFiles.length) {
-      return [];
-    }
-
-    let ocrTracks = [];
-    try {
-      ocrTracks = await runPaddleOcrOnCopiedTracks(ffmpeg, writtenFiles, messageId);
-      if (ocrTracks.length) {
-        sendOffscreenLog(`OCR (PaddleOCR) extracted ${ocrTracks.length} subtitle track(s) from image-based streams`, 'info', messageId);
-        return ocrTracks;
-      }
-    } catch (ocrErr) {
-      sendOffscreenLog(`OCR failed: ${ocrErr?.message || ocrErr}`, 'error', messageId);
-    }
-
-    try {
-      ocrTracks = await runTesseractOcrOnCopiedTracks(ffmpeg, writtenFiles, messageId);
-      if (ocrTracks.length) {
-        sendOffscreenLog(`OCR (Tesseract) extracted ${ocrTracks.length} subtitle track(s) from image-based streams`, 'info', messageId);
-        return ocrTracks;
-      }
-    } catch (tessErr) {
-      sendOffscreenLog(`Tesseract OCR failed: ${tessErr?.message || tessErr}`, 'error', messageId);
-    }
-
-    return [];
-  } finally {
-    for (const file of writtenFiles) {
-      cleanupFsFile(ffmpeg, file);
-    }
-  }
+  throwImageSubtitleOcrNotImplemented(messageId, copyTracks.length);
 }
 
 async function decodeAudioWindows(windows, mode, messageId, opts = {}) {
-  const ffmpeg = await getFFmpeg(messageId);
-  const results = [];
   const sharedBuffer = windows.length > 1 && windows.every(w => w.buffer === windows[0].buffer);
-  let sharedInputName = null;
+  const sharedOpfsSource = windows.length >= 1
+    && windows.every((w) => w.buffer === windows[0].buffer)
+    && isOpfsTempInputSource(windows[0]?.buffer)
+    ? windows[0].buffer
+    : null;
+  let sharedInputSource = null;
   const audioStreamIndex = Number.isInteger(opts.audioStreamIndex) ? opts.audioStreamIndex : 0;
   sendOffscreenLog(`Audio decode mapping: 0:a:${audioStreamIndex}`, 'info', messageId);
 
-  if (sharedBuffer) {
-    sharedInputName = 'shared_input.bin';
-    ffmpeg.FS('writeFile', sharedInputName, windows[0].buffer instanceof Uint8Array ? windows[0].buffer : new Uint8Array(windows[0].buffer));
+  if (sharedOpfsSource) {
+    try {
+      sendOffscreenLog('Dispatching shared OPFS audio decode to dedicated FFmpeg worker.', 'info', messageId);
+      const workerResult = await runAudioDecodeInWorker(sharedOpfsSource, windows, messageId, { audioStreamIndex });
+      const audioWindows = Array.isArray(workerResult?.audioWindows) ? workerResult.audioWindows : [];
+      if (audioWindows.length) {
+        sendOffscreenLog(`Dedicated audio worker decoded ${audioWindows.length} window(s).`, 'info', messageId);
+        return audioWindows.map((win) => ({
+          audioBytes: win?.audioBytes instanceof Uint8Array
+            ? win.audioBytes
+            : new Uint8Array(win?.audioBytes || []),
+          startMs: Math.round(win?.startMs || 0)
+        }));
+      }
+      throw new Error('Dedicated audio worker returned no windows');
+    } catch (workerErr) {
+      const sourceBytes = Number(sharedOpfsSource?.byteLength) || Number(sharedOpfsSource?.totalBytes) || 0;
+      if (sourceBytes > OPFS_STAGED_COPY_MAX_BYTES) {
+        throw workerErr;
+      }
+      sendOffscreenLog(`Dedicated audio worker failed; falling back to direct offscreen core (${workerErr?.message || workerErr})`, 'warn', messageId);
+    }
   }
+
+  const ffmpeg = await getFFmpeg(messageId);
+  const results = [];
 
   for (let i = 0; i < windows.length; i++) {
     const win = windows[i];
-    const inputName = sharedInputName || `win_${i}.bin`;
     const outputName = `win_${i}.wav`;
-    const buffer = win.buffer instanceof Uint8Array ? win.buffer : new Uint8Array(win.buffer);
-    ffmpeg.FS('writeFile', inputName, buffer);
+    let inputSource = sharedInputSource;
     const buildArgs = () => {
+      const inputName = inputSource?.inputName || `win_${i}.bin`;
       const base = ['-i', inputName, '-vn'];
       if (Number.isInteger(audioStreamIndex) && audioStreamIndex >= 0) {
         base.push('-map', `0:a:${audioStreamIndex}`);
@@ -2323,8 +2488,14 @@ async function decodeAudioWindows(windows, mode, messageId, opts = {}) {
       return args;
     };
 
-    const args = buildArgs();
     try {
+      if (!inputSource) {
+        inputSource = await buildDemuxInputSource(ffmpeg, win.buffer, messageId);
+        if (sharedBuffer) {
+          sharedInputSource = inputSource;
+        }
+      }
+      const args = buildArgs();
       await ffmpeg.run(...args);
       const data = ffmpeg.FS('readFile', outputName);
       if (!data?.byteLength) {
@@ -2339,19 +2510,22 @@ async function decodeAudioWindows(windows, mode, messageId, opts = {}) {
       });
     } catch (err) {
       const msg = err?.message || String(err);
+      const sourceBytes = typeof win?.buffer?.byteLength === 'number'
+        ? win.buffer.byteLength
+        : (typeof win?.buffer?.totalBytes === 'number' ? win.buffer.totalBytes : 0);
       throw new Error(
-        `FFmpeg decode failed at window ${i + 1}/${windows.length} (start=${win?.startSec ?? 'n/a'}s seek=${win?.seekToSec ?? 0}s dur=${win?.durSec ?? 'n/a'}s bytes=${buffer?.byteLength || 0}): ${msg}`
+        `FFmpeg decode failed at window ${i + 1}/${windows.length} (start=${win?.startSec ?? 'n/a'}s seek=${win?.seekToSec ?? 0}s dur=${win?.durSec ?? 'n/a'}s bytes=${sourceBytes || 0}): ${msg}`
       );
     } finally {
       try { ffmpeg.FS('unlink', outputName); } catch (_) { /* ignore */ }
-      if (!sharedInputName) {
-        try { ffmpeg.FS('unlink', inputName); } catch (_) { /* ignore */ }
+      if (!sharedBuffer && inputSource?.cleanup) {
+        try { inputSource.cleanup(); } catch (_) { /* ignore */ }
       }
     }
   }
 
-  if (sharedInputName) {
-    try { ffmpeg.FS('unlink', sharedInputName); } catch (_) { /* ignore */ }
+  if (sharedInputSource?.cleanup) {
+    try { sharedInputSource.cleanup(); } catch (_) { /* ignore */ }
   }
 
   if (!results.length) {
@@ -2669,6 +2843,7 @@ async function extractSubtitleTextTracks(ffmpeg, inputName, messageId, opts = {}
   const targets = getSubtitleExtractionTargets(opts);
   const outputArgs = Array.isArray(opts.outputArgs) ? opts.outputArgs : [];
   const inputArgs = Array.isArray(opts.inputArgs) ? opts.inputArgs : [];
+  let skippedKindMismatches = 0;
   for (const target of targets) {
     throwIfOffscreenJobAborted(messageId);
     const streamIndex = target.streamIndex;
@@ -2701,8 +2876,20 @@ async function extractSubtitleTextTracks(ffmpeg, inputName, messageId, opts = {}
         extracted.push(outName);
         continue;
       }
-      sendOffscreenLog(`Text subtitle conversion failed for stream ${streamIndex + 1}: ${err?.message || err}`, 'warn', messageId);
+      const classified = classifyOffscreenFfmpegError(err?.message || err, 'FFmpeg failed to convert the subtitle stream to text output.');
+      if (classified.category === 'subtitle-kind-mismatch') {
+        skippedKindMismatches += 1;
+        continue;
+      }
+      sendOffscreenLog(`Text subtitle conversion failed for stream ${streamIndex + 1}: ${classified.summary}`, 'warn', messageId);
     }
+  }
+  if (skippedKindMismatches > 0) {
+    sendOffscreenLog(
+      `Skipped direct text extraction for ${skippedKindMismatches} stream(s) that FFmpeg reported as non-text/bitmap mismatches.`,
+      'info',
+      messageId
+    );
   }
   return extracted;
 }
@@ -2756,7 +2943,11 @@ async function extractSubtitleTextTracksBatch(ffmpeg, inputName, messageId, opts
     }
     await ffmpeg.run(argv);
   } catch (err) {
-    sendOffscreenLog(`Batch text extraction failed; retrying streams individually (${err?.message || err})`, 'warn', messageId);
+    const classified = classifyOffscreenFfmpegError(err?.message || err, 'FFmpeg batch text extraction failed.');
+    const retryReason = classified.category === 'subtitle-kind-mismatch'
+      ? 'FFmpeg hit one or more streams that cannot be converted directly to text output.'
+      : classified.summary;
+    sendOffscreenLog(`Batch text extraction failed; retrying streams individually (${retryReason})`, 'warn', messageId);
     return await extractSubtitleTextTracks(ffmpeg, inputName, messageId, opts);
   }
 
@@ -2787,9 +2978,9 @@ async function extractSubtitleTextTracksBatch(ffmpeg, inputName, messageId, opts
   return extracted.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 }
 
-async function demuxSubtitles(source, messageId) {
+async function demuxSubtitles(source, messageId, opts = {}) {
   if (!isOpfsTempInputSource(source)) {
-    return await demuxSubtitlesDirect(source, messageId);
+    return await demuxSubtitlesDirect(source, messageId, opts);
   }
 
   const byteLength = typeof source?.byteLength === 'number'
@@ -2833,11 +3024,18 @@ async function demuxSubtitles(source, messageId) {
     }
   }
 
+  if (plannedBitmapStreams.length && !plannedTextStreams.length) {
+    throwImageSubtitleOcrNotImplemented(messageId, plannedBitmapStreams.length);
+  }
+
   try {
     sendOffscreenLog('Dispatching OPFS demux to a dedicated FFmpeg worker for mounted-file access...', 'info', messageId);
     const workerResult = await runDemuxInWorker(source, messageId, {
-      streamPlans: subtitlePlan,
-      textStreamPlans: plannedTextStreams
+      streamPlans: Array.isArray(opts.streamPlans) && opts.streamPlans.length ? opts.streamPlans : subtitlePlan,
+      textStreamPlans: Array.isArray(opts.textStreamPlans) && opts.textStreamPlans.length ? opts.textStreamPlans : plannedTextStreams,
+      inputArgs: Array.isArray(opts.inputArgs) ? opts.inputArgs : [],
+      skipFlatCueRepair: opts.skipFlatCueRepair === true,
+      skipCopyTracks: opts.skipCopyTracks === true
     });
     let tracks = Array.isArray(workerResult?.textTracks) ? workerResult.textTracks : [];
     const copyTracks = Array.isArray(workerResult?.copyTracks) ? workerResult.copyTracks : [];
@@ -2852,11 +3050,7 @@ async function demuxSubtitles(source, messageId) {
           );
           throw new Error('Text subtitle streams were detected, but FFmpeg could not extract them.');
         }
-        tracks = await runOcrOnBinaryCopiedTracks(copyTracks, messageId);
-        if (!tracks.length) {
-          sendOffscreenLog('Detected subtitle streams (likely image/bitmap, e.g., PGS/VobSub) that cannot be converted to SRT. OCR was attempted but no text was produced.', 'error', messageId);
-          throw new Error('Image-based subtitle streams require OCR; no text could be produced.');
-        }
+        await runOcrOnBinaryCopiedTracks(copyTracks, messageId);
       } else {
         const advertisedSubtitles = (mkvProbe?.subtitleTracks?.length || 0) + (mkvProbe?.subtitleAttachments?.length || 0);
         if (!advertisedSubtitles) {
@@ -2894,11 +3088,11 @@ async function demuxSubtitles(source, messageId) {
       throw workerErr;
     }
     sendOffscreenLog(`Mounted OPFS demux worker failed; falling back to the direct offscreen core (${workerErr?.message || workerErr})`, 'warn', messageId);
-    return await demuxSubtitlesDirect(source, messageId);
+    return await demuxSubtitlesDirect(source, messageId, opts);
   }
 }
 
-async function demuxSubtitlesDirect(source, messageId) {
+async function demuxSubtitlesDirect(source, messageId, opts = {}) {
   const byteLength = typeof source?.byteLength === 'number'
     ? source.byteLength
     : (typeof source?.size === 'number' ? source.size : 0);
@@ -2914,6 +3108,9 @@ async function demuxSubtitlesDirect(source, messageId) {
   const subtitlePlan = buildMkvSubtitleExtractionPlan(mkvProbe);
   const plannedTextStreams = subtitlePlan.filter((entry) => entry.kind === 'text');
   const plannedBitmapStreams = subtitlePlan.filter((entry) => entry.kind !== 'text');
+  const inputArgs = Array.isArray(opts.inputArgs) && opts.inputArgs.length
+    ? opts.inputArgs
+    : ['-analyzeduration', '60M', '-probesize', '60M'];
   if (mkvProbe) {
     const scanMb = Math.round((mkvProbe.scanBytes / (1024 * 1024)) * 10) / 10;
     const summaryBits = [
@@ -2938,6 +3135,9 @@ async function demuxSubtitlesDirect(source, messageId) {
       );
     }
   }
+  if (plannedBitmapStreams.length && !plannedTextStreams.length) {
+    throwImageSubtitleOcrNotImplemented(messageId, plannedBitmapStreams.length);
+  }
   const ffmpeg = await getFFmpeg(messageId);
   throwIfOffscreenJobAborted(messageId);
   if (ffmpeg?.setLogger) {
@@ -2960,7 +3160,7 @@ async function demuxSubtitlesDirect(source, messageId) {
     inputName = inputSource.inputName;
     try {
       sendOffscreenLog('Running FFmpeg to extract subtitle streams...', 'info', messageId);
-      if (!subtitlePlan.length || plannedBitmapStreams.length) {
+      if ((!subtitlePlan.length || plannedBitmapStreams.length) && opts.skipCopyTracks !== true) {
         copiedTracks = await extractSubtitleCopyTracks(ffmpeg, inputName, messageId, {
           ...(plannedBitmapStreams.length ? { streamPlans: plannedBitmapStreams } : {})
         });
@@ -2968,11 +3168,11 @@ async function demuxSubtitlesDirect(source, messageId) {
       if (plannedTextStreams.length || !subtitlePlan.length) {
         files = await extractSubtitleTextTracksBatch(ffmpeg, inputName, messageId, {
           ...(plannedTextStreams.length ? { streamPlans: plannedTextStreams } : {}),
-          inputArgs: ['-analyzeduration', '60M', '-probesize', '60M']
+          inputArgs
         });
       }
       if (copiedTracks.length) {
-        sendOffscreenLog(`Preserved ${copiedTracks.length} subtitle stream(s) as MKV copy for fallback/OCR`, 'info', messageId);
+        sendOffscreenLog(`Preserved ${copiedTracks.length} subtitle stream(s) as MKV copy for bitmap-only detection.`, 'info', messageId);
       }
     } catch (err) {
       const errMsg = err?.message || String(err);
@@ -2980,7 +3180,7 @@ async function demuxSubtitlesDirect(source, messageId) {
       sendOffscreenLog(`FFmpeg demux failed: ${errMsg}`, 'error', messageId);
       if (
         /^No subtitle streams found in media\.?$/i.test(errMsg)
-        || /^Image-based subtitle streams require OCR/i.test(errMsg)
+        || /^Image-based subtitle streams were detected, but OCR extraction is not implemented yet\.?$/i.test(errMsg)
         || /^FFmpeg demux failed:/i.test(errMsg)
         || isAbortError(err)
       ) {
@@ -3010,6 +3210,7 @@ async function demuxSubtitlesDirect(source, messageId) {
   // Try to convert copied text tracks into their native text container when possible.
   if (copiedTracks.length) {
     const existingIds = new Set(files.map((file) => parseExtractedOutputIndex(file)).filter((value) => Number.isInteger(value) && value > 0));
+    let skippedCopyTextConversions = 0;
     for (const copyName of copiedTracks) {
       const trackIdx = parseExtractedOutputIndex(copyName);
       if (trackIdx !== null && existingIds.has(trackIdx)) {
@@ -3036,8 +3237,20 @@ async function demuxSubtitlesDirect(source, messageId) {
         }
       } catch (convErr) {
         cleanupFsFile(ffmpeg, textName);
-        sendOffscreenLog(`Failed to convert ${copyName} to text subtitle output: ${convErr?.message || convErr}`, 'warn', messageId);
+        const classified = classifyOffscreenFfmpegError(convErr?.message || convErr, 'FFmpeg could not convert the copied subtitle stream to text output.');
+        if (classified.category === 'subtitle-kind-mismatch') {
+          skippedCopyTextConversions += 1;
+          continue;
+        }
+        sendOffscreenLog(`Failed to convert ${copyName} to text subtitle output: ${classified.summary}`, 'warn', messageId);
       }
+    }
+    if (skippedCopyTextConversions > 0) {
+      sendOffscreenLog(
+        `Left ${skippedCopyTextConversions} copied subtitle stream(s) as MKV because FFmpeg could not convert them directly to text output.`,
+        'info',
+        messageId
+      );
     }
     if (convertedSrts.length) {
       files = [...files, ...convertedSrts].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
@@ -3055,28 +3268,7 @@ async function demuxSubtitlesDirect(source, messageId) {
         );
         throw new Error('Text subtitle streams were detected, but FFmpeg could not extract them.');
       }
-      let ocrTracks = [];
-      try {
-        ocrTracks = await runPaddleOcrOnCopiedTracks(ffmpeg, copiedTracks, messageId);
-        if (ocrTracks.length) {
-          sendOffscreenLog(`OCR (PaddleOCR) extracted ${ocrTracks.length} subtitle track(s) from image-based streams`, 'info', messageId);
-          return normalizeExtractedTracks(ocrTracks);
-        }
-      } catch (ocrErr) {
-        sendOffscreenLog(`OCR failed: ${ocrErr?.message || ocrErr}`, 'error', messageId);
-      }
-      // Fallback to Tesseract if Paddle fails or produces no text
-      try {
-        ocrTracks = await runTesseractOcrOnCopiedTracks(ffmpeg, copiedTracks, messageId);
-        if (ocrTracks.length) {
-          sendOffscreenLog(`OCR (Tesseract) extracted ${ocrTracks.length} subtitle track(s) from image-based streams`, 'info', messageId);
-          return normalizeExtractedTracks(ocrTracks);
-        }
-      } catch (tessErr) {
-        sendOffscreenLog(`Tesseract OCR failed: ${tessErr?.message || tessErr}`, 'error', messageId);
-      }
-      sendOffscreenLog('Detected subtitle streams (likely image/bitmap, e.g., PGS/VobSub) that cannot be converted to SRT. OCR was attempted but no text was produced.', 'error', messageId);
-      throw new Error('Image-based subtitle streams require OCR; no text could be produced.');
+      await runOcrOnBinaryCopiedTracks(copiedTracks, messageId);
     }
     sendOffscreenLog('FFmpeg completed but no subtitle streams were found.', 'warn', messageId);
     throw new Error('No subtitle streams found in media.');
@@ -3111,7 +3303,10 @@ async function demuxSubtitlesDirect(source, messageId) {
 
   // If timelines look broken (e.g., all cues share the same timestamp), retry with a PTS-normalized conversion.
   const timelineStatus = analyzeCueTimelines(tracks);
-  if (timelineStatus.flatCueStarts || timelineStatus.nonMonotonicCues) {
+  const skipFlatCueRepair = opts?.skipFlatCueRepair === true;
+  if (timelineStatus.flatCueStarts && skipFlatCueRepair && !timelineStatus.nonMonotonicCues) {
+    sendOffscreenLog('Detected flat cue timestamps in a bounded demux pass; skipping PTS normalization for this slice.', 'info', messageId);
+  } else if (timelineStatus.flatCueStarts || timelineStatus.nonMonotonicCues) {
     sendOffscreenLog(
       `Detected ${timelineStatus.flatCueStarts ? 'flat' : 'non-monotonic'} cue timestamps; retrying with PTS normalization...`,
       'warn',
@@ -3175,7 +3370,7 @@ async function demuxSubtitlesDirect(source, messageId) {
 
   // If still broken, try per-stream remux + setpts-style reset before text conversion.
   const postNormStatus = analyzeCueTimelines(tracks);
-  if (postNormStatus.flatCueStarts || postNormStatus.nonMonotonicCues) {
+  if (postNormStatus.nonMonotonicCues || (postNormStatus.flatCueStarts && !skipFlatCueRepair)) {
     sendOffscreenLog('Timelines still broken after PTS normalization; trying per-stream remux...', 'warn', messageId);
     try {
       const remuxed = [];
@@ -3294,6 +3489,31 @@ function withTimeout(promise, ms, label) {
     timer = setTimeout(() => reject(new Error(label || `Operation timed out after ${ms}ms`)), ms);
   });
   return Promise.race([promise.finally(() => clearTimeout(timer)), timeout]);
+}
+
+const DIRECT_AUDIO_DECODE_TIMEOUT_MS = 3 * 60 * 1000;
+const OPFS_AUDIO_DECODE_BASE_TIMEOUT_MS = 12 * 60 * 1000;
+const OPFS_AUDIO_DECODE_MAX_TIMEOUT_MS = 30 * 60 * 1000;
+const OPFS_AUDIO_DECODE_EXTRA_TIMEOUT_PER_GIB_MS = 6 * 60 * 1000;
+
+function computeAudioDecodeTimeoutMs(windows) {
+  const hasOpfsInput = (windows || []).some((win) => isOpfsTempInputSource(win?.buffer));
+  if (!hasOpfsInput) {
+    return DIRECT_AUDIO_DECODE_TIMEOUT_MS;
+  }
+  const maxBytes = (windows || []).reduce((max, win) => {
+    const bytes = Number(win?.buffer?.byteLength) || Number(win?.buffer?.totalBytes) || 0;
+    return Math.max(max, bytes);
+  }, 0);
+  const oneGiB = 1024 * 1024 * 1024;
+  if (maxBytes <= oneGiB) {
+    return OPFS_AUDIO_DECODE_BASE_TIMEOUT_MS;
+  }
+  const extraGiB = Math.ceil((maxBytes - oneGiB) / oneGiB);
+  return Math.min(
+    OPFS_AUDIO_DECODE_MAX_TIMEOUT_MS,
+    OPFS_AUDIO_DECODE_BASE_TIMEOUT_MS + (extraGiB * OPFS_AUDIO_DECODE_EXTRA_TIMEOUT_PER_GIB_MS)
+  );
 }
 
 /**
@@ -3757,13 +3977,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         throwIfOffscreenJobAborted(requestId);
         const requestBytes = incomingBuffer?.byteLength || incomingBuffer?.size || 0;
         const sizeMb = Math.round((requestBytes / (1024 * 1024)) * 10) / 10;
-        const timeoutMs = transferMethod === 'opfs'
-          ? 10 * 60 * 1000
-          : 90000;
+        const timeoutMs = computeOffscreenDemuxTimeoutMs(transferMethod, requestBytes);
         sendOffscreenLog(`Received demux request (job ${requestId || 'n/a'}), size: ${sizeMb} MB${transferMethod === 'opfs' ? ' via OPFS' : ''}`, 'info', requestId);
         sendOffscreenLog(`Offscreen env: SAB=${typeof SharedArrayBuffer !== 'undefined' ? 'yes' : 'no'}, COI=${self.crossOriginIsolated === false ? 'no' : 'yes'}`, 'info', requestId);
         const tracks = await withTimeout(
-          demuxSubtitles(incomingBuffer, requestId),
+          demuxSubtitles(incomingBuffer, requestId, {
+            inputArgs: Array.isArray(message?.inputArgs) ? message.inputArgs : [],
+            skipCopyTracks: message?.skipCopyTracks === true,
+            skipFlatCueRepair: message?.skipFlatCueRepair === true,
+            streamPlans: Array.isArray(message?.streamPlans) ? message.streamPlans : [],
+            textStreamPlans: Array.isArray(message?.textStreamPlans) ? message.textStreamPlans : []
+          }),
           timeoutMs,
           `FFmpeg demux timed out in offscreen page${requestId ? ` (job ${requestId})` : ''}`
         );
@@ -3772,10 +3996,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         throwIfOffscreenJobAborted(requestId);
         respond({ success: true, tracks: prepared.tracks, chunked: prepared.chunked });
       } catch (err) {
+        const errMessage = err?.message || String(err);
+        if (/timed out/i.test(errMessage)) {
+          markOffscreenJobAborted(requestId, errMessage);
+        }
         const level = isAbortError(err) ? 'warn' : 'error';
         console[level === 'error' ? 'error' : 'warn']('[Offscreen] Extraction failed:', err);
-        sendOffscreenLog(`Demux failed: ${err?.message || err}`, level, requestId);
-        respond({ success: false, error: err?.message || String(err) });
+        sendOffscreenLog(`Demux failed: ${errMessage}`, level, requestId);
+        respond({ success: false, error: errMessage });
       } finally {
         finishOffscreenJob(requestId);
       }
@@ -3847,6 +4075,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // Some decode requests reuse the same transferId across multiple windows to avoid
         // duplicating large buffers. Cache each loaded buffer so we only consume IDB/chunks once.
         const bufferCache = new Map();
+        const normalizeOpfsBuffer = (value) => {
+          if (!isOpfsTempInputSource(value)) {
+            return null;
+          }
+          const opfsTempName = String(value.opfsTempName || '').trim();
+          const byteLength = Number(value?.byteLength) || Number(value?.totalBytes) || 0;
+          if (!opfsTempName || !byteLength) {
+            return null;
+          }
+          const cacheKey = `opfs:${opfsTempName}:${byteLength}`;
+          const cached = bufferCache.get(cacheKey);
+          if (cached) {
+            return cached;
+          }
+          const normalized = {
+            opfsTempName,
+            byteLength,
+            totalBytes: Number(value?.totalBytes) || byteLength,
+            contentType: value?.contentType || ''
+          };
+          bufferCache.set(cacheKey, normalized);
+          return normalized;
+        };
 
         const windows = [];
         for (let idx = 0; idx < rawWindows.length; idx++) {
@@ -3877,6 +4128,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return normalized;
           };
 
+          const directOpfsBuffer = normalizeOpfsBuffer(buf);
+          if (directOpfsBuffer) {
+            throwIfOffscreenJobAborted(requestId);
+            windows.push({
+              buffer: directOpfsBuffer,
+              startSec: w?.startSec,
+              durSec: w?.durSec,
+              seekToSec: w?.seekToSec
+            });
+            continue;
+          }
+
           if (transferId) {
             buf = await loadFromTransfer(transferId, transferMethod);
           } else if (buf && buf.transferId) {
@@ -3894,9 +4157,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
         }
 
+        const decodeTimeoutMs = computeAudioDecodeTimeoutMs(windows);
         const decoded = await withTimeout(
           decodeAudioWindows(windows, 'single', requestId, { audioStreamIndex: message?.audioStreamIndex }),
-          180000,
+          decodeTimeoutMs,
           `FFmpeg audio decode timed out${requestId ? ` (job ${requestId})` : ''}`
         );
         throwIfOffscreenJobAborted(requestId);

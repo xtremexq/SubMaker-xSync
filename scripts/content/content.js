@@ -190,13 +190,16 @@ function schedulePendingExtractFailure(messageId, errorMsg) {
       success: false,
       error: errorMsg || translate('xsync.content.extractFailed', 'Extraction failed')
     });
-  }, 8000);
+  }, 60000);
   pendingExtractResults.set(messageId, timer);
 }
 
 function isTransientPortError(err) {
   const msg = (err?.message || err || '').toLowerCase();
-  return msg.includes('message port closed') || msg.includes('receiving end does not exist');
+  return msg.includes('message port closed')
+    || msg.includes('receiving end does not exist')
+    || msg.includes('message channel closed before a response was received')
+    || msg.includes('a listener indicated an asynchronous response');
 }
 
 function normalizeExtractModeValue(mode) {
@@ -207,7 +210,8 @@ function normalizeExtractModeValue(mode) {
     .replace(/[-_\s]+/g, '-');      // align separators for comparisons
   if (cleaned === 'complete' || cleaned === 'full' || cleaned === 'fullfetch') return 'complete';
   if (cleaned === 'smart') return 'smart';
-  return 'smart';
+  if (cleaned === 'chunked-progressive-opfs-demux') return 'chunked-progressive-opfs-demux';
+  return 'complete';
 }
 
 // Forward progress events from the background worker to the web page
@@ -221,6 +225,7 @@ chrome.runtime.onMessage.addListener((msg) => {
       status: msg.status
     });
   } else if (msg?.type === 'EXTRACT_PROGRESS') {
+    clearPendingExtract(msg.messageId);
     sendToPage({
       type: 'SUBMAKER_EXTRACT_PROGRESS',
       source: 'extension',
@@ -229,6 +234,9 @@ chrome.runtime.onMessage.addListener((msg) => {
       status: msg.status
     });
   } else if (msg?.type === 'SUBMAKER_DEBUG_LOG') {
+    if (msg.messageId) {
+      clearPendingExtract(msg.messageId);
+    }
     console[msg.level === 'error' ? 'error' : msg.level === 'warn' ? 'warn' : 'log']('[SubMaker xSync][Debug]', msg.text || '', msg.messageId ? `(job ${msg.messageId})` : '');
     sendToPage({
       type: 'SUBMAKER_DEBUG_LOG',
